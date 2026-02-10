@@ -1,183 +1,141 @@
 #!/bin/bash
+exec </dev/tty
 
-# FRP Installation Script (Final - Matches Telegram bot exactly)
-# No unnecessary apt update/install curl (assumes curl is already present)
-# Uses Go template with parseNumberRangePair
-# transport.useCompression = true
-# IPv6 without brackets
+SYSCTL_FILE="/etc/sysctl.d/99-bbr-tcp.conf"
+BACKUP_FILE="/etc/sysctl.d/99-bbr-tcp.conf.bak"
 
-show_menu() {
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "❌ Run as root"
+        exit 1
+    fi
+}
+
+kernel_supports_bbr() {
+    sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr
+}
+
+install_bbr() {
     clear
-    echo "=================================="
-    echo "     FRP Reverse Tunnel Setup     "
-    echo "=================================="
-    echo "1) Install FRP on Iran (Server - frps)"
-    echo "2) Install FRP on Kharej (Client - frpc)"
-    echo "3) Remove FRP"
+    echo "🚀 Installing BBR + TCP Optimization"
+
+    if ! kernel_supports_bbr; then
+        echo "❌ Kernel does NOT support BBR"
+        echo "👉 Kernel >= 4.9 required"
+        exit 1
+    fi
+
+    # Backup
+    [[ -f $SYSCTL_FILE ]] && cp $SYSCTL_FILE $BACKUP_FILE
+
+    cat > $SYSCTL_FILE <<'EOF'
+############################################
+# BBR + TCP Advanced Optimization
+############################################
+
+# --- Congestion Control ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- TCP Latency & Stability ---
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_window_scaling = 1
+
+# --- Buffers ---
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+
+# --- Queue & Backlog ---
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 600000
+
+# --- Connection Reuse ---
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+
+# --- Protection & Cleanups ---
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_orphans = 32768
+EOF
+
+    sysctl --system >/dev/null 2>&1
+
+    echo
+    echo "✅ BBR ENABLED"
+    sysctl net.ipv4.tcp_congestion_control
+    lsmod | grep bbr || true
+    echo
+    echo "⚠️ Reboot is RECOMMENDED (not mandatory)"
+}
+
+remove_bbr() {
+    clear
+    echo "🧹 Removing BBR + TCP Optimization"
+
+    if [[ -f $BACKUP_FILE ]]; then
+        mv $BACKUP_FILE $SYSCTL_FILE
+    else
+        rm -f $SYSCTL_FILE
+    fi
+
+    sysctl --system >/dev/null 2>&1
+
+    echo "✅ Restored system TCP settings"
+}
+
+status_bbr() {
+    clear
+    echo "📊 BBR STATUS"
+    echo
+    sysctl net.ipv4.tcp_congestion_control
+    echo
+    echo "Available CC:"
+    sysctl net.ipv4.tcp_available_congestion_control
+    echo
+    echo "Queue Disc:"
+    sysctl net.core.default_qdisc
+}
+
+menu() {
+    clear
+    echo "======================================"
+    echo "      🚀 BBR + TCP OPTIMIZER"
+    echo "======================================"
+    echo "1) Install / Enable BBR"
+    echo "2) Remove / Restore Defaults"
+    echo "3) Show Status"
     echo "4) Exit"
-    echo "=================================="
-    read -p "Choose an option [1-4]: " choice
+    echo "======================================"
+    read -r -p "Choose [1-4]: " choice < /dev/tty
 }
 
-install_server() {
-    echo "=== Installing FRP Server (frps) on Iran ==="
-
-    curl -L -o /usr/local/bin/frps http://81.12.32.210/downloads/frps
-    chmod +x /usr/local/bin/frps
-
-    mkdir -p /root/frp/server
-
-    cat > /root/frp/server/server-3090.toml <<'EOF'
-# Auto-generated frps config
-bindAddr = "::"
-bindPort = 3090
-
-transport.heartbeatTimeout = 90
-transport.maxPoolCount = 65535
-transport.tcpMux = false
-transport.tcpMuxKeepaliveInterval = 10
-transport.tcpKeepalive = 120
-
-auth.method = "token"
-auth.token = "tun100"
-EOF
-
-    cat > /etc/systemd/system/frps@.service <<'EOF'
-[Unit]
-Description=FRP Server Service (%i)
-Documentation=https://gofrp.org/en/docs/overview/
-After=network.target nss-lookup.target network-online.target
-
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-ExecStart=/usr/local/bin/frps -c /root/frp/server/%i.toml
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable frps@server-3090.service
-    systemctl start frps@server-3090.service
-
-    # Crontab reload every 3 hours
-    (crontab -l 2>/dev/null | grep -v 'pkill -10' ; echo '0 */3 * * * pkill -10 -x frpc; pkill -10 -x frps') | crontab -
-
-    echo "FRP Server installed and started!"
-    echo "Listening on port 3090 with token 'tun100'"
-}
-
-install_client() {
-    echo "=== Installing FRP Client (frpc) on Kharej ==="
-
-    curl -L -o /usr/local/bin/frpc https://raw.githubusercontent.com/lostsoul6/frp-file/refs/heads/main/frpc
-    chmod +x /usr/local/bin/frpc
-
-    mkdir -p /root/frp/client
-
-    read -p "Enter Iran server address (IPv4 or IPv6, e.g. 1.2.3.4 or 2a10:250:56ff:feb4:3b26): " server_addr
-    read -p "Enter inbound ports to forward (comma-separated or ranges, e.g. 1194 or 6000-6005,8443) [default: 8080]: " ports
-    ports=${ports:-8080}
-
-    # Escape quotes for safe insertion into the template
-    escaped_ports=$(printf '%s' "$ports" | sed 's/"/\\"/g')
-
-    cat > /root/frp/client/client-3090.toml <<EOF
-serverAddr = "$server_addr"
-serverPort = 3090
-
-loginFailExit = false
-
-auth.method = "token"
-auth.token = "tun100"
-
-transport.protocol = "tcp"
-transport.tcpMux = false
-transport.tcpMuxKeepaliveInterval = 10
-transport.dialServerTimeout = 10
-transport.dialServerKeepalive = 120
-transport.poolCount = 20
-transport.heartbeatInterval = 30
-transport.heartbeatTimeout = 90
-transport.tls.enable = false
-transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 30
-transport.quic.maxIncomingStreams = 100000
-
-{{- range \$_, \$v := parseNumberRangePair "$escaped_ports" "$escaped_ports" }}
-[[proxies]]
-name = "tcp-{{ \$v.First }}"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = {{ \$v.First }}
-remotePort = {{ \$v.Second }}
-transport.useEncryption = false
-transport.useCompression = false
-{{- end }}
-EOF
-
-    cat > /etc/systemd/system/frpc@.service <<'EOF'
-[Unit]
-Description=FRP Client Service (%i)
-Documentation=https://gofrp.org/en/docs/overview/
-After=network.target nss-lookup.target network-online.target
-
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-ExecStart=/usr/local/bin/frpc -c /root/frp/client/%i.toml
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable frpc@client-3090.service
-    systemctl start frpc@client-3090.service
-
-    # Crontab reload every 3 hours
-    (crontab -l 2>/dev/null | grep -v 'pkill -10' ; echo '0 */3 * * * pkill -10 -x frpc; pkill -10 -x frps') | crontab -
-
-    echo "FRP Client installed and started!"
-    echo "Connecting to $server_addr:3090"
-    echo "Forwarding ports: $ports"
-    echo "Config uses Go template - frpc renders the proxy sections at runtime."
-}
-
-remove_frp() {
-    echo "=== Removing FRP ==="
-
-    systemctl stop frps@server-3090.service frpc@client-3090.service 2>/dev/null || true
-    systemctl disable frps@server-3090.service frpc@client-3090.service 2>/dev/null || true
-    rm -f /etc/systemd/system/frps@.service /etc/systemd/system/frpc@.service
-    rm -rf /root/frp
-    rm -f /usr/local/bin/frps /usr/local/bin/frpc
-    systemctl daemon-reload
-
-    # Remove crontab entries
-    (crontab -l 2>/dev/null | grep -v 'pkill -10') | crontab -
-
-    echo "FRP removed successfully!"
-}
+check_root
 
 while true; do
-    show_menu
+    menu
     case $choice in
-        1) install_server ;;
-        2) install_client ;;
-        3) remove_frp ;;
-        4) echo "Goodbye!"; exit 0 ;;
-        *) echo "Invalid option. Please try again." ;;
+        1) install_bbr ;;
+        2) remove_bbr ;;
+        3) status_bbr ;;
+        4) exit 0 ;;
+        *) echo "❌ Invalid option" ;;
     esac
     echo
-    read -p "Press Enter to continue..."
+    read -r -p "Press Enter to continue..." < /dev/tty
 done
