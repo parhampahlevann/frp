@@ -85,21 +85,21 @@ set_mtu_auto() {
     ping -c 2 -M do -s 1472 8.8.8.8 >/dev/null 2>&1
     if [[ $? -eq 0 ]]; then MTU=1500; else MTU=1420; fi
     ip link set dev $IFACE mtu $MTU
-    echo "MTU set to $MTU on $IFACE"
+    echo "✅ MTU set to $MTU on $IFACE"
 }
 
 set_mtu_manual() {
     read -r -p "Enter MTU value (e.g. 1400): " mtu < /dev/tty
     IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
     ip link set dev $IFACE mtu $mtu
-    echo "MTU set to $mtu on $IFACE"
+    echo "✅ MTU set to $mtu on $IFACE"
 }
 
 # ---------- DNS ----------
 set_dns_hn() {
-    # هتزنر DNS ایمن
-    echo -e "nameserver 213.133.98.98\nnameserver 213.133.99.99" > /etc/resolv.conf
-    echo "✅ DNS changed to Hetzner servers safely"
+    # هتزنر DNS با پینگ پایین
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+    echo "✅ DNS changed to 1.1.1.1 (Cloudflare) and 8.8.8.8 (Google) safely"
 }
 
 # ---------- Status ----------
@@ -122,7 +122,7 @@ menu() {
     echo "1) 🇮🇷 Iran → Kharej Deep Optimization"
     echo "2) 🌍 Foreign Server Ultra Mode"
     echo "3) Change MTU"
-    echo "4) Change DNS to Hetzner"
+    echo "4) Change DNS to Hetzner (1.1.1.1 / 8.8.8.8)"
     echo "5) Reboot System"
     echo "6) Status"
     echo "7) Exit"
@@ -144,7 +144,7 @@ while true; do
             case $mtu_choice in
                 1) set_mtu_auto ;;
                 2) set_mtu_manual ;;
-                *) echo "Invalid MTU option" ;;
+                *) echo "❌ Invalid MTU option" ;;
             esac
         ;;
         4) set_dns_hn ;;
@@ -155,7 +155,7 @@ while true; do
         ;;
         6) show_status ;;
         7) exit 0 ;;
-        *) echo "Invalid option" ;;
+        *) echo "❌ Invalid option" ;;
     esac
     echo
     read -r -p "Press Enter to continue..." < /dev/tty
