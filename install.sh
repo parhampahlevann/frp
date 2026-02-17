@@ -1,545 +1,886 @@
 #!/bin/bash
-exec </dev/tty
 
-# Color codes for better output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-CONFIG_FILE="/etc/sysctl.d/99-network-optimizer.conf"
-BACKUP_DIR="/root/network-backup"
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/DaggerConnect"
+SYSTEMD_DIR="/etc/systemd/system"
+LATEST_RELEASE_API="https://api.github.com/repos/itsFLoKi/DaggerConnect/releases/latest"
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}❌ Run as root${NC}"
+banner() {
+    clear
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}       DaggerConnect Optimized v2.0${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}  Only HTTP Mux + License-Free${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+check_root() { [[ $EUID -ne 0 ]] && { echo -e "${RED}Run as root${NC}"; exit 1; }; }
+
+install_deps() {
+    echo -e "${YELLOW}Installing dependencies...${NC}"
+    if command -v apt &>/dev/null; then
+        apt update -qq && apt install -y wget curl tar openssl iproute2 dnsutils > /dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y wget curl tar openssl iproute2 bind-utils > /dev/null 2>&1
+    fi
+    echo -e "${GREEN}Done${NC}"
+}
+
+download_binary() {
+    echo -e "${YELLOW}Downloading DaggerConnect...${NC}"
+    mkdir -p "$INSTALL_DIR"
+    LATEST_VERSION=$(curl -s "$LATEST_RELEASE_API" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    [[ -z "$LATEST_VERSION" ]] && LATEST_VERSION="v1.4.1"
+    BINARY_URL="https://github.com/itsFLoKi/DaggerConnect/releases/download/${LATEST_VERSION}/DaggerConnect"
+    echo -e "  Version: ${GREEN}${LATEST_VERSION}${NC}"
+    [[ -f "$INSTALL_DIR/DaggerConnect" ]] && cp "$INSTALL_DIR/DaggerConnect" "$INSTALL_DIR/DaggerConnect.bak"
+    if wget -q --show-progress "$BINARY_URL" -O "$INSTALL_DIR/DaggerConnect"; then
+        chmod +x "$INSTALL_DIR/DaggerConnect"
+        rm -f "$INSTALL_DIR/DaggerConnect.bak"
+        echo -e "${GREEN}Downloaded${NC}"
+    else
+        echo -e "${RED}Download failed${NC}"
+        [[ -f "$INSTALL_DIR/DaggerConnect.bak" ]] && mv "$INSTALL_DIR/DaggerConnect.bak" "$INSTALL_DIR/DaggerConnect"
         exit 1
     fi
 }
 
-create_backup_dir() {
-    mkdir -p "$BACKUP_DIR"
-    mkdir -p "$BACKUP_DIR/sysctl.d"
-    mkdir -p "$BACKUP_DIR/network"
-    mkdir -p "$BACKUP_DIR/dns"
+get_current_version() {
+    if [[ -f "$INSTALL_DIR/DaggerConnect" ]]; then
+        "$INSTALL_DIR/DaggerConnect" -v 2>&1 | grep -oP 'v\d+\.\d+' || echo "unknown"
+    else
+        echo "not-installed"
+    fi
 }
 
-backup_current_settings() {
-    create_backup_dir
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    
-    # Backup sysctl settings
-    if [[ -f $CONFIG_FILE ]]; then
-        cp "$CONFIG_FILE" "$BACKUP_DIR/sysctl.d/99-network-optimizer.conf.$timestamp"
-    fi
-    
-    # Backup DNS settings
-    cp /etc/resolv.conf "$BACKUP_DIR/dns/resolv.conf.$timestamp" 2>/dev/null
-    
-    # Backup network configs
-    cp -r /etc/network/interfaces "$BACKUP_DIR/network/interfaces.$timestamp" 2>/dev/null
-    cp -r /etc/netplan/*.yaml "$BACKUP_DIR/network/" 2>/dev/null
-    cp -r /etc/systemd/network/* "$BACKUP_DIR/network/" 2>/dev/null
-    
-    echo -e "${GREEN}✅ Backup created in $BACKUP_DIR${NC}"
+gen_cert() {
+    local domain=${1:-www.google.com}
+    mkdir -p "$CONFIG_DIR/certs"
+    openssl req -x509 -newkey rsa:4096 \
+        -keyout "$CONFIG_DIR/certs/key.pem" \
+        -out "$CONFIG_DIR/certs/cert.pem" \
+        -days 365 -nodes \
+        -subj "/C=US/ST=CA/L=SF/O=Corp/CN=${domain}" 2>/dev/null
+    echo -e "${GREEN}Certificate generated (${domain})${NC}"
 }
 
-# ---------- Fix Google Sites Issue ----------
-fix_google_sites() {
-    clear
-    echo -e "${BLUE}🔧 Fixing Google Sites connectivity issue...${NC}"
-    
-    # 1. Fix IPv6 (disable if problematic)
-    echo -e "\n${YELLOW}1. Checking IPv6 configuration...${NC}"
-    if sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q 0; then
-        echo "Disabling IPv6 temporarily for Google sites..."
-        sysctl -w net.ipv6.conf.all.disable_ipv6=1
-        sysctl -w net.ipv6.conf.default.disable_ipv6=1
-        
-        # Make it persistent
-        cat >> /etc/sysctl.d/99-disable-ipv6.conf <<EOF
-# Disable IPv6 for better Google connectivity
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-EOF
-        echo -e "${GREEN}✅ IPv6 disabled${NC}"
-    fi
-    
-    # 2. Fix MTU for Google services
-    echo -e "\n${YELLOW}2. Optimizing MTU for Google services...${NC}"
-    IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-    
-    # Test different MTUs specifically for Google
-    for mtu in 1460 1472 1480 1492 1500; do
-        echo -n "Testing MTU $mtu with Google... "
-        if ping -c 2 -M do -s $((mtu - 28)) -W 2 google.com >/dev/null 2>&1; then
-            echo -e "${GREEN}OK${NC}"
-            ip link set dev "$IFACE" mtu "$mtu"
-            echo -e "${GREEN}✅ MTU set to $mtu on $IFACE${NC}"
-            
-            # Make persistent
-            if [[ -d /etc/systemd/network ]]; then
-                mkdir -p /etc/systemd/network
-                cat > "/etc/systemd/network/10-$IFACE.link" <<EOF
-[Match]
-Name=$IFACE
+create_service() {
+    local mode=$1
+    cat > "$SYSTEMD_DIR/DaggerConnect-${mode}.service" << EOF
+[Unit]
+Description=DaggerConnect ${mode}
+After=network.target
 
-[Link]
-MTUBytes=$mtu
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$CONFIG_DIR
+ExecStart=$INSTALL_DIR/DaggerConnect -c $CONFIG_DIR/${mode}.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
 EOF
-            fi
+    systemctl daemon-reload
+    echo -e "${GREEN}Service DaggerConnect-${mode} created${NC}"
+}
+
+optimize_system() {
+    echo -e "${CYAN}━━━ System Optimization ━━━${NC}"
+    IFACE=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
+    [[ -z "$IFACE" ]] && IFACE="eth0"
+    echo -e "  Interface: ${GREEN}$IFACE${NC}"
+
+    # بهینه‌سازی برای TCP Mux بدون قطعی
+    sysctl -w net.core.rmem_max=16777216 > /dev/null 2>&1
+    sysctl -w net.core.wmem_max=16777216 > /dev/null 2>&1
+    sysctl -w net.core.rmem_default=4194304 > /dev/null 2>&1
+    sysctl -w net.core.wmem_default=4194304 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_retries2=8 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_syn_retries=3 > /dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=5000 > /dev/null 2>&1
+    sysctl -w net.core.somaxconn=4096 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_probes=5 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fin_timeout=20 > /dev/null 2>&1
+    
+    # فعال کردن BBR
+    modprobe tcp_bbr 2>/dev/null && {
+        sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
+        sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    }
+
+    cat > /etc/sysctl.d/99-daggerconnect.conf << 'SYSEOF'
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_retries2=8
+net.ipv4.tcp_syn_retries=3
+net.core.netdev_max_backlog=5000
+net.core.somaxconn=4096
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_fin_timeout=20
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+SYSEOF
+    echo -e "${GREEN}System optimized for stable TCP Mux${NC}"
+}
+
+# ============================================================================
+# LICENSE-FREE SETUP (بدون لایسنس)
+# ============================================================================
+
+setup_without_license() {
+    echo ""
+    echo -e "${CYAN}━━━ License-Free Mode (PSK Only) ━━━${NC}"
+    echo -e "${YELLOW}در این حالت فقط از PSK برای احراز هویت استفاده می‌شود${NC}"
+    
+    while true; do
+        read -sp "  Enter PSK (حداقل 8 کاراکتر): " V_PSK
+        echo ""
+        if [[ ${#V_PSK} -ge 8 ]]; then
             break
         else
-            echo -e "${RED}FAIL${NC}"
+            echo -e "${RED}PSK باید حداقل 8 کاراکتر باشد${NC}"
         fi
     done
     
-    # 3. Optimize TCP for Google
-    echo -e "\n${YELLOW}3. Optimizing TCP for Google services...${NC}"
-    cat >> /etc/sysctl.d/99-google-optimizer.conf <<EOF
-# Google services optimization
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_window_scaling = 1
-EOF
-    sysctl --system >/dev/null 2>&1
+    # ذخیره PSK در فایل
+    echo "$V_PSK" > "$CONFIG_DIR/psk.key"
+    chmod 600 "$CONFIG_DIR/psk.key"
     
-    # 4. Fix DNS for Google
-    echo -e "\n${YELLOW}4. Configuring Google-friendly DNS...${NC}"
-    fix_dns_hetzner
-    
-    # 5. Add Google IPs to hosts file for faster resolution
-    echo -e "\n${YELLOW}5. Adding Google IPs to hosts file...${NC}"
-    cat >> /etc/hosts <<'EOF'
-
-# Google services direct IPs
-142.250.185.46 google.com
-142.250.185.46 www.google.com
-142.250.185.46 mail.google.com
-142.250.185.46 drive.google.com
-142.250.185.46 docs.google.com
-142.250.185.46 youtube.com
-142.250.185.46 www.youtube.com
-216.58.200.46 googleapis.com
-216.58.200.46 gstatic.com
-EOF
-    
-    echo -e "\n${GREEN}✅ Google sites fix applied!${NC}"
-    echo -e "${YELLOW}Testing Google connectivity...${NC}"
-    if curl -s -I --connect-timeout 5 https://google.com >/dev/null 2>&1; then
-        echo -e "${GREEN}✅ Google is now accessible!${NC}"
-    else
-        echo -e "${RED}❌ Still having issues. Trying alternative fix...${NC}"
-        # Alternative: Use proxy DNS
-        fix_dns_hetzner_force
-    fi
+    echo -e "${GREEN}✓ PSK تنظیم شد${NC}"
 }
 
-# ---------- Hetzner DNS Fix (Complete Overhaul) ----------
-fix_dns_hetzner() {
-    clear
-    echo -e "${BLUE}🔧 Hetzner DNS Configuration (Safe Mode)${NC}"
-    
-    # Backup everything first
-    backup_current_settings
-    
-    # Detect Hetzner
-    if curl -s --connect-timeout 2 http://169.254.169.254/hetzner-metadata >/dev/null 2>&1 || \
-       hostname -f | grep -qi "hetzner"; then
-        echo -e "${YELLOW}📡 Hetzner server detected${NC}"
-    fi
-    
-    # Method 1: Disable systemd-resolved if it's causing issues
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        echo -e "\n${YELLOW}1. Disabling systemd-resolved...${NC}"
-        systemctl stop systemd-resolved
-        systemctl disable systemd-resolved
-        
-        # Remove symlink and create real resolv.conf
-        rm -f /etc/resolv.conf
-    fi
-    
-    # Create fresh resolv.conf
-    cat > /etc/resolv.conf <<'EOF'
-# Hetzner Optimized DNS Configuration
-# Primary: Cloudflare (lowest latency)
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-# Secondary: Google (reliable)
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-# Tertiary: Quad9 (secure)
-nameserver 9.9.9.9
-nameserver 149.112.112.112
-options rotate
-options timeout:1
-options attempts:3
-options edns0
-options trust-ad
-EOF
-    
-    # Make it immutable to prevent overwriting
-    chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}⚠️  Could not lock resolv.conf${NC}"
-    
-    # Method 2: For Ubuntu/Debian with netplan
-    if [[ -d /etc/netplan ]]; then
-        echo -e "\n${YELLOW}2. Configuring Netplan...${NC}"
-        for file in /etc/netplan/*.yaml; do
-            if [[ -f "$file" ]]; then
-                cp "$file" "$file.backup"
-                # Simple sed replacement for nameservers
-                sed -i '/nameservers:/,/addresses:/ s/addresses:.*/addresses: [1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4]/' "$file"
-            fi
-        done
-        netplan apply 2>/dev/null
-    fi
-    
-    # Method 3: For Debian with interfaces
-    if [[ -f /etc/network/interfaces ]]; then
-        echo -e "\n${YELLOW}3. Configuring network interfaces...${NC}"
-        cp /etc/network/interfaces /etc/network/interfaces.backup
-        # Add DNS if not present
-        if ! grep -q "dns-nameservers" /etc/network/interfaces; then
-            echo "" >> /etc/network/interfaces
-            echo "dns-nameservers 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4" >> /etc/network/interfaces
-        fi
-    fi
-    
-    # Method 4: For RHEL/CentOS
-    if [[ -f /etc/sysconfig/network-scripts/ifcfg-eth0 ]]; then
-        echo -e "\n${YELLOW}4. Configuring NetworkManager...${NC}"
-        for ifcfg in /etc/sysconfig/network-scripts/ifcfg-*; do
-            sed -i '/^DNS/d' "$ifcfg"
-            echo "DNS1=1.1.1.1" >> "$ifcfg"
-            echo "DNS2=1.0.0.1" >> "$ifcfg"
-            echo "DNS3=8.8.8.8" >> "$ifcfg"
-        done
-        systemctl restart NetworkManager 2>/dev/null
-    fi
-    
-    # Flush DNS cache
-    echo -e "\n${YELLOW}5. Flushing DNS cache...${NC}"
-    systemd-resolve --flush-caches 2>/dev/null || resolvectl flush-caches 2>/dev/null || true
-    
-    # Test DNS
-    echo -e "\n${YELLOW}Testing DNS configuration...${NC}"
-    if nslookup google.com 1.1.1.1 >/dev/null 2>&1; then
-        echo -e "${GREEN}✅ DNS working with Cloudflare${NC}"
-    else
-        echo -e "${RED}❌ DNS not working, applying emergency fix...${NC}"
-        fix_dns_hetzner_emergency
-    fi
-}
+# ============================================================================
+# PORT MAPPING COLLECTOR (با پشتیبانی از کاما)
+# ============================================================================
 
-# Emergency DNS fix (nuclear option)
-fix_dns_hetzner_emergency() {
-    echo -e "${RED}⚠️  Applying emergency DNS fix...${NC}"
-    
-    # Kill everything that might be managing DNS
-    systemctl stop systemd-resolved 2>/dev/null
-    systemctl disable systemd-resolved 2>/dev/null
-    systemctl stop NetworkManager 2>/dev/null
-    systemctl stop resolvconf 2>/dev/null
-    
-    # Force remove and recreate resolv.conf
-    rm -f /etc/resolv.conf
-    
-    # Create minimal working DNS
-    cat > /etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-options timeout:1 attempts:1 rotate
-EOF
-    
-    # Lock it
-    chattr +i /etc/resolv.conf 2>/dev/null
-    
-    # Add to hosts file as backup
-    cat >> /etc/hosts <<'EOF'
-# DNS Emergency Fallback
-1.1.1.1 one.one.one.one
-8.8.8.8 google-dns.google.com
-EOF
-    
-    echo -e "${GREEN}✅ Emergency DNS fix applied${NC}"
-}
-
-# Force DNS fix (most aggressive)
-fix_dns_hetzner_force() {
-    echo -e "${RED}💣 Applying FORCE DNS fix...${NC}"
-    
-    # Remove all DNS managers
-    apt-get remove --purge -y resolvconf systemd-resolved 2>/dev/null
-    yum remove -y systemd-resolved 2>/dev/null
-    
-    # Create static resolv.conf
-    rm -f /etc/resolv.conf
-    cat > /etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
-    
-    # Lock it forever
-    chattr +i /etc/resolv.conf
-    
-    # Disable IPv6 completely
-    cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOF
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
-    sysctl --system >/dev/null 2>&1
-    
-    echo -e "${GREEN}✅ Force DNS fix applied - DNS is now locked${NC}"
-}
-
-# ---------- Iran Optimization (Enhanced) ----------
-iran_kharej_mode() {
-    clear
-    echo -e "${BLUE}🇮🇷 Iran → Kharej Deep Optimization${NC}"
-    
-    backup_current_settings
-    
-    cat > "$CONFIG_FILE" <<'EOF'
-# Iran → Kharej Deep Optimization
-# Optimized for high-latency, packet loss environment
-
-# Buffer settings for high latency
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_mem = 262144 524288 1048576
-
-# Congestion control for high latency
-net.ipv4.tcp_congestion_control = hybla
-net.core.default_qdisc = fq
-net.ipv4.tcp_ecn = 2
-
-# Retransmission optimization
-net.ipv4.tcp_retries2 = 10
-net.ipv4.tcp_syn_retries = 4
-net.ipv4.tcp_synack_retries = 4
-net.ipv4.tcp_frto = 2
-net.ipv4.tcp_recovery = 1
-
-# Keepalive for unstable connections
-net.ipv4.tcp_keepalive_time = 200
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_fin_timeout = 15
-
-# MTU and probing
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-
-# Buffer auto-tuning
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-EOF
-
-    sysctl --system >/dev/null 2>&1
-    echo -e "${GREEN}✅ Iran → Kharej Deep Mode Applied${NC}"
-    
-    # Auto-configure MTU for Iran
-    echo -e "\n${YELLOW}Configuring optimal MTU for Iran...${NC}"
-    IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-    ip link set dev "$IFACE" mtu 1420
-    echo -e "${GREEN}✅ MTU set to 1420 on $IFACE${NC}"
-}
-
-# ---------- Foreign Server Ultra Mode ----------
-foreign_mode() {
-    clear
-    echo -e "${BLUE}🌍 Foreign Server Ultra Mode${NC}"
-    
-    backup_current_settings
-    
-    cat > "$CONFIG_FILE" <<'EOF'
-# Foreign Server Ultra Performance
-# Optimized for low-latency, high-bandwidth
-
-# Max buffer sizes
-net.core.rmem_max = 268435456
-net.core.wmem_max = 268435456
-net.ipv4.tcp_rmem = 4096 87380 268435456
-net.ipv4.tcp_wmem = 4096 65536 268435456
-net.ipv4.tcp_mem = 262144 524288 2097152
-
-# Modern congestion control
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_ecn = 1
-
-# High connection handling
-net.core.netdev_max_backlog = 500000
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65536
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Fast recycling
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 3
-EOF
-
-    sysctl --system >/dev/null 2>&1
-    echo -e "${GREEN}✅ Foreign Server Ultra Mode Applied${NC}"
-}
-
-# ---------- MTU Optimization ----------
-optimize_mtu() {
-    clear
-    echo -e "${BLUE}📏 MTU Optimization${NC}"
-    
-    IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-    if [[ -z "$IFACE" ]]; then
-        echo -e "${RED}❌ No network interface found${NC}"
-        return
-    fi
-    
-    echo "Interface: $IFACE"
-    echo "Testing optimal MTU..."
+collect_port_mappings() {
+    MAPPINGS=""
+    MAP_COUNT=0
+    echo -e "  ${GREEN}Single${NC}: 8008  ${GREEN}Range${NC}: 1000/2000  ${GREEN}Custom${NC}: 5000=8008"
+    echo -e "  ${GREEN}Comma${NC}: 80,443,8080  ${GREEN}RangeMap${NC}: 1000/1010=2000/2010"
     echo ""
     
-    best_mtu=1500
-    for mtu in 1500 1492 1480 1472 1460 1450 1440 1430 1420 1410 1400; do
-        echo -n "Testing MTU $mtu... "
-        if ping -c 2 -M do -s $((mtu - 28)) -W 1 google.com >/dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC}"
-            best_mtu=$mtu
+    while true; do
+        echo -e "${YELLOW}  Mapping #$((MAP_COUNT+1))${NC}"
+        echo "    1) tcp  2) udp  3) both"
+        read -p "    Protocol [1]: " pc
+        case $pc in 2) proto="udp" ;; 3) proto="both" ;; *) proto="tcp" ;; esac
+        
+        read -p "    Port(s) (می‌توانید با کاما جدا کنید): " pinput
+        [[ -z "$pinput" ]] && { echo -e "${RED}    Empty${NC}"; continue; }
+        
+        pinput=$(echo "$pinput" | tr -d ' ')
+        local bip="0.0.0.0" tip="127.0.0.1"
+        
+        _add() {
+            local t=$1 bp=$2 tp=$3
+            if [[ "$t" == "both" ]]; then
+                MAPPINGS+="  - type: tcp\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
+                MAPPINGS+="  - type: udp\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
+                MAP_COUNT=$((MAP_COUNT+2))
+            else
+                MAPPINGS+="  - type: ${t}\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
+                MAP_COUNT=$((MAP_COUNT+1))
+            fi
+        }
+        
+        # پشتیبانی از کاما
+        if [[ "$pinput" == *","* ]]; then
+            IFS=',' read -ra PORTS <<< "$pinput"
+            for port in "${PORTS[@]}"; do
+                port=$(echo "$port" | tr -d ' ')
+                if [[ "$port" =~ ^[0-9]+$ ]]; then
+                    _add "$proto" "$port" "$port"
+                    echo -e "${GREEN}    ${port} -> ${port}${NC}"
+                fi
+            done
+        elif [[ "$pinput" =~ ^([0-9]+)/([0-9]+)=([0-9]+)/([0-9]+)$ ]]; then
+            for ((i=0; i<=${BASH_REMATCH[2]}-${BASH_REMATCH[1]}; i++)); do
+                _add "$proto" $(( ${BASH_REMATCH[1]}+i )) $(( ${BASH_REMATCH[3]}+i ))
+            done
+            echo -e "${GREEN}    Range map added${NC}"
+        elif [[ "$pinput" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+            for ((p=${BASH_REMATCH[1]}; p<=${BASH_REMATCH[2]}; p++)); do _add "$proto" $p $p; done
+            echo -e "${GREEN}    Range added${NC}"
+        elif [[ "$pinput" =~ ^([0-9]+)=([0-9]+)$ ]]; then
+            _add "$proto" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+            echo -e "${GREEN}    ${BASH_REMATCH[1]} -> ${BASH_REMATCH[2]}${NC}"
+        elif [[ "$pinput" =~ ^[0-9]+$ ]]; then
+            _add "$proto" "$pinput" "$pinput"
+            echo -e "${GREEN}    ${pinput} -> ${pinput}${NC}"
         else
-            echo -e "${RED}✗${NC}"
+            echo -e "${RED}    Invalid${NC}"; continue
         fi
+        
+        read -p "    Add more? [y/N]: " m
+        [[ ! "$m" =~ ^[Yy]$ ]] && break
     done
     
-    echo -e "\n${GREEN}✅ Best MTU: $best_mtu${NC}"
-    read -p "Apply this MTU? (y/n): " confirm
-    if [[ $confirm == "y" ]]; then
-        ip link set dev "$IFACE" mtu "$best_mtu"
-        echo -e "${GREEN}✅ MTU set to $best_mtu${NC}"
-    fi
+    [[ $MAP_COUNT -eq 0 ]] && {
+        MAPPINGS="  - type: tcp\n    bind: \"0.0.0.0:8080\"\n    target: \"127.0.0.1:8080\"\n"
+        MAP_COUNT=1
+        echo -e "${YELLOW}  Default: 8080->8080${NC}"
+    }
 }
 
-# ---------- Complete System Fix ----------
-complete_fix() {
-    clear
-    echo -e "${BLUE}🛠️  Complete System Network Fix${NC}"
-    echo "=================================="
-    
-    # 1. Fix DNS
-    echo -e "\n${YELLOW}1. Fixing DNS...${NC}"
-    fix_dns_hetzner_force
-    
-    # 2. Fix Google sites
-    echo -e "\n${YELLOW}2. Fixing Google sites...${NC}"
-    sysctl -w net.ipv6.conf.all.disable_ipv6=1
-    sysctl -w net.ipv6.conf.default.disable_ipv6=1
-    
-    # 3. Optimize MTU
-    echo -e "\n${YELLOW}3. Optimizing MTU...${NC}"
-    IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-    ip link set dev "$IFACE" mtu 1460
-    
-    # 4. Apply BBR
-    echo -e "\n${YELLOW}4. Enabling BBR...${NC}"
-    modprobe tcp_bbr 2>/dev/null
-    echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null
-    sysctl -w net.ipv4.tcp_congestion_control=bbr
-    sysctl -w net.core.default_qdisc=fq
-    
-    # 5. Restart network
-    echo -e "\n${YELLOW}5. Restarting network...${NC}"
-    systemctl restart networking 2>/dev/null || systemctl restart NetworkManager 2>/dev/null
-    
-    echo -e "\n${GREEN}✅ Complete system fix applied!${NC}"
-    echo -e "${YELLOW}Please reboot for all changes to take effect.${NC}"
-}
+# ============================================================================
+# DEFAULTS PER PROFILE (بهینه‌سازی شده برای HTTP Mux)
+# ============================================================================
 
-# ---------- Menu ----------
-menu() {
-    clear
-    echo "=========================================="
-    echo "     Network Optimization Menu v3.0"
-    echo "=========================================="
-    echo "1) 🇮🇷 Iran → Kharej (Deep Optimize)"
-    echo "2) 🌍 Foreign Server (Ultra Mode)"
-    echo "3) 📏 MTU Optimization"
-    echo "4) 🔧 DNS Fix (Hetzner Safe Mode)"
-    echo "5) 💣 DNS Fix (Force Mode - Recommended for Hetzner)"
-    echo "6) 🔧 Fix Google Sites (Not Loading)"
-    echo "7) 🛠️  Complete System Fix (Fix All)"
-    echo "8) 📊 Show Status"
-    echo "9) 📁 Backup Current Settings"
-    echo "10) 🔄 Restore from Backup"
-    echo "11) ⚠️  Reboot System"
-    echo "0) ❌ Exit"
-    echo "=========================================="
-    read -r -p "Choose [0-11]: " choice
-}
-
-# ---------- Main ----------
-check_root
-
-while true; do
-    menu
-    case $choice in
-        1) iran_kharej_mode ;;
-        2) foreign_mode ;;
-        3) optimize_mtu ;;
-        4) fix_dns_hetzner ;;
-        5) fix_dns_hetzner_force ;;
-        6) fix_google_sites ;;
-        7) complete_fix ;;
-        8) 
-            clear
-            echo -e "${BLUE}📊 System Status${NC}"
-            echo "================"
-            echo -e "\n${YELLOW}DNS:${NC}"
-            cat /etc/resolv.conf
-            echo -e "\n${YELLOW}IPv6:${NC}"
-            sysctl -n net.ipv6.conf.all.disable_ipv6
-            echo -e "\n${YELLOW}MTU:${NC}"
-            ip link | grep mtu | head -1
-            echo -e "\n${YELLOW}TCP CC:${NC}"
-            sysctl -n net.ipv4.tcp_congestion_control
-            echo -e "\n${YELLOW}Google Test:${NC}"
-            curl -s -I --connect-timeout 3 https://google.com -o /dev/null -w "HTTP Status: %{http_code}\n" || echo "Failed"
+set_defaults() {
+    local p=$1
+    case $p in
+        aggressive)
+            V_SMUX_KA=3
+            V_SMUX_RECV=33554432
+            V_SMUX_STREAM=33554432
+            V_KCP_INT=5
+            V_KCP_SNDWND=4096
+            V_KCP_RCVWND=4096
+            V_MTU=1400
+            V_DNS="8.8.8.8,1.1.1.1"
             ;;
-        9) backup_current_settings ;;
-        10) 
-            echo "Available backups:"
-            ls -la "$BACKUP_DIR/dns/" 2>/dev/null || echo "No backups found"
-            read -p "Enter timestamp to restore: " ts
-            if [[ -f "$BACKUP_DIR/dns/resolv.conf.$ts" ]]; then
-                cp "$BACKUP_DIR/dns/resolv.conf.$ts" /etc/resolv.conf
-                echo -e "${GREEN}✅ DNS restored${NC}"
-            fi
+        latency)
+            V_SMUX_KA=5
+            V_SMUX_RECV=16777216
+            V_SMUX_STREAM=16777216
+            V_KCP_INT=8
+            V_KCP_SNDWND=2048
+            V_KCP_RCVWND=2048
+            V_MTU=1350
+            V_DNS="8.8.8.8,1.1.1.1"
             ;;
-        11)
-            echo -e "${RED}⚠️  Rebooting in 5 seconds...${NC}"
-            sleep 5
-            reboot
+        *)
+            V_SMUX_KA=4
+            V_SMUX_RECV=25165824
+            V_SMUX_STREAM=25165824
+            V_KCP_INT=6
+            V_KCP_SNDWND=3072
+            V_KCP_RCVWND=3072
+            V_MTU=1450
+            V_DNS="8.8.8.8,1.1.1.1"
             ;;
-        0) 
-            echo -e "${GREEN}👋 Goodbye!${NC}"
-            exit 0
-            ;;
-        *) echo -e "${RED}❌ Invalid option${NC}" ;;
     esac
-    echo
-    read -r -p "Press Enter to continue..."
-done
+    
+    V_SMUX_FRAME=49152
+    V_SMUX_VER=2
+    V_KCP_NODELAY=1
+    V_KCP_RESEND=2
+    V_KCP_NC=1
+    
+    V_ADV_TCP_ND=true
+    V_ADV_TCP_KA=30
+    V_ADV_TCP_RBUF=8388608
+    V_ADV_TCP_WBUF=8388608
+    V_ADV_WS_RBUF=131072
+    V_ADV_WS_WBUF=131072
+    V_ADV_WS_COMP=false
+    V_ADV_CLEANUP=5
+    V_ADV_SESS_TO=120
+    V_ADV_CONN_TO=45
+    V_ADV_STREAM_TO=300
+    V_ADV_MAX_CONN=5000
+    V_ADV_MAX_UDP=2000
+    V_ADV_UDP_TO=600
+    V_ADV_UDP_BUF=8388608
+    
+    V_OBF_ON=true
+    V_OBF_MINP=32
+    V_OBF_MAXP=1024
+    V_OBF_MIND=0
+    V_OBF_MAXD=0
+    V_OBF_BURST=0.1
+    
+    V_HTTP_DOM="www.google.com"
+    V_HTTP_PATH="/search"
+    V_HTTP_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    
+    V_MAX_SESS=0
+    V_HEARTBEAT=15
+    V_VERBOSE=false
+    
+    V_LB_STRAT="round_robin"
+    V_LB_HEALTH=15
+    V_LB_FAIL_DLY=1000
+    V_LB_MAXFAIL=5
+    V_LB_RECOV=60
+    V_LB_STICKY=false
+}
+
+# ============================================================================
+# ADVANCED EDITOR (با گزینه‌های MTU و DNS)
+# ============================================================================
+
+edit_advanced() {
+    echo ""
+    echo -e "${CYAN}━━━ Advanced Settings ━━━${NC}"
+    
+    echo -e "${YELLOW}Network Optimization:${NC}"
+    read -p "  MTU [$V_MTU]: " v
+    V_MTU=${v:-$V_MTU}
+    
+    read -p "  DNS Servers (comma separated) [$V_DNS]: " v
+    V_DNS=${v:-$V_DNS}
+    
+    echo -e "${YELLOW}SMUX (TCP Mux) Settings:${NC}"
+    read -p "  keepalive [$V_SMUX_KA]: " v
+    V_SMUX_KA=${v:-$V_SMUX_KA}
+    
+    read -p "  max_recv [$V_SMUX_RECV]: " v
+    V_SMUX_RECV=${v:-$V_SMUX_RECV}
+    
+    read -p "  max_stream [$V_SMUX_RECV]: " v
+    V_SMUX_STREAM=${v:-$V_SMUX_STREAM}
+    
+    read -p "  frame_size [$V_SMUX_FRAME]: " v
+    V_SMUX_FRAME=${v:-$V_SMUX_FRAME}
+    
+    echo -e "${YELLOW}KCP Settings:${NC}"
+    read -p "  nodelay [$V_KCP_NODELAY]: " v
+    V_KCP_NODELAY=${v:-$V_KCP_NODELAY}
+    
+    read -p "  interval [$V_KCP_INT]: " v
+    V_KCP_INT=${v:-$V_KCP_INT}
+    
+    read -p "  sndwnd [$V_KCP_SNDWND]: " v
+    V_KCP_SNDWND=${v:-$V_KCP_SNDWND}
+    
+    read -p "  rcvwnd [$V_KCP_RCVWND]: " v
+    V_KCP_RCVWND=${v:-$V_KCP_RCVWND}
+    
+    echo -e "${YELLOW}TCP Settings:${NC}"
+    read -p "  tcp_nodelay [$V_ADV_TCP_ND]: " v
+    V_ADV_TCP_ND=${v:-$V_ADV_TCP_ND}
+    
+    read -p "  tcp_keepalive [$V_ADV_TCP_KA]: " v
+    V_ADV_TCP_KA=${v:-$V_ADV_TCP_KA}
+    
+    echo -e "${YELLOW}Obfuscation:${NC}"
+    read -p "  enabled [$V_OBF_ON]: " v
+    V_OBF_ON=${v:-$V_OBF_ON}
+    
+    echo -e "${YELLOW}HTTP Mimicry:${NC}"
+    read -p "  fake_domain [$V_HTTP_DOM]: " v
+    V_HTTP_DOM=${v:-$V_HTTP_DOM}
+}
+
+# ============================================================================
+# TRANSPORT SELECTOR (فقط HTTP Mux)
+# ============================================================================
+
+select_transport() {
+    # فقط httpmux باقی مانده
+    V_TRANSPORT="httpmux"
+    echo -e "  Transport: ${GREEN}httpmux${NC} (only)"
+}
+
+# ============================================================================
+# PROFILE SELECTOR
+# ============================================================================
+
+select_profile() {
+    echo ""
+    echo -e "${YELLOW}Profile:${NC}"
+    echo "  1) balanced [default]"
+    echo "  2) aggressive (more bandwidth)"
+    echo "  3) latency (gaming/voip)"
+    read -p "  Choice [1]: " pc
+    case $pc in 2) V_PROFILE="aggressive" ;; 3) V_PROFILE="latency" ;; *) V_PROFILE="balanced" ;; esac
+}
+
+# ============================================================================
+# SHARED CONFIG
+# ============================================================================
+
+write_shared_config() {
+    local f=$1
+    
+    # تنظیم DNS در سیستم
+    if [[ -n "$V_DNS" ]]; then
+        echo "nameserver ${V_DNS//,/\nnameserver }" > /etc/resolv.conf 2>/dev/null
+    fi
+    
+    cat >> "$f" << YAML
+
+smux:
+  keepalive: ${V_SMUX_KA}
+  max_recv: ${V_SMUX_RECV}
+  max_stream: ${V_SMUX_STREAM}
+  frame_size: ${V_SMUX_FRAME}
+  version: ${V_SMUX_VER}
+
+kcp:
+  nodelay: ${V_KCP_NODELAY}
+  interval: ${V_KCP_INT}
+  resend: ${V_KCP_RESEND}
+  nc: ${V_KCP_NC}
+  sndwnd: ${V_KCP_SNDWND}
+  rcvwnd: ${V_KCP_RCVWND}
+  mtu: ${V_MTU}
+
+advanced:
+  tcp_nodelay: ${V_ADV_TCP_ND}
+  tcp_keepalive: ${V_ADV_TCP_KA}
+  tcp_read_buffer: ${V_ADV_TCP_RBUF}
+  tcp_write_buffer: ${V_ADV_TCP_WBUF}
+  websocket_read_buffer: ${V_ADV_WS_RBUF}
+  websocket_write_buffer: ${V_ADV_WS_WBUF}
+  websocket_compression: ${V_ADV_WS_COMP}
+  cleanup_interval: ${V_ADV_CLEANUP}
+  session_timeout: ${V_ADV_SESS_TO}
+  connection_timeout: ${V_ADV_CONN_TO}
+  stream_timeout: ${V_ADV_STREAM_TO}
+  max_connections: ${V_ADV_MAX_CONN}
+  max_udp_flows: ${V_ADV_MAX_UDP}
+  udp_flow_timeout: ${V_ADV_UDP_TO}
+  udp_buffer_size: ${V_ADV_UDP_BUF}
+
+obfuscation:
+  enabled: ${V_OBF_ON}
+  min_padding: ${V_OBF_MINP}
+  max_padding: ${V_OBF_MAXP}
+  min_delay_ms: ${V_OBF_MIND}
+  max_delay_ms: ${V_OBF_MAXD}
+  burst_chance: ${V_OBF_BURST}
+
+http_mimic:
+  fake_domain: "${V_HTTP_DOM}"
+  fake_path: "${V_HTTP_PATH}"
+  user_agent: "${V_HTTP_UA}"
+  chunked_encoding: false
+  session_cookie: true
+YAML
+}
+
+# ============================================================================
+# MULTI-LISTENER COLLECTOR
+# ============================================================================
+
+collect_listeners() {
+    LISTENERS_BLOCK=""
+    LISTENER_COUNT=0
+    CERT_GENERATED=false
+
+    while true; do
+        echo ""
+        echo -e "${CYAN}━━━ Listener #$((LISTENER_COUNT+1)) ━━━${NC}"
+
+        select_transport
+        
+        # پورت پیشفرض 2020
+        local default_port=2020
+        [[ $LISTENER_COUNT -gt 0 ]] && default_port=$((2020 + LISTENER_COUNT))
+        read -p "  Listen port [${default_port}]: " l_port
+        l_port=${l_port:-$default_port}
+
+        local l_cert="" l_key=""
+        # برای httpmux احتیاج به سرتیفیکیت نیست، اما اگر کاربر بخواهد می‌تواند اضافه کند
+        read -p "  Use SSL? (y/N): " use_ssl
+        if [[ "$use_ssl" =~ ^[Yy]$ ]]; then
+            if [[ "$CERT_GENERATED" != "true" ]]; then
+                read -p "  Cert domain [$V_HTTP_DOM]: " cd; cd=${cd:-$V_HTTP_DOM}
+                gen_cert "$cd"
+                CERT_GENERATED=true
+            fi
+            l_cert="$CONFIG_DIR/certs/cert.pem"
+            l_key="$CONFIG_DIR/certs/key.pem"
+            V_TRANSPORT="httpsmux"  # تغییر به httpsmux اگر SSL فعال باشد
+        fi
+
+        echo ""
+        echo -e "${YELLOW}  Port mappings for listener :${l_port} [${V_TRANSPORT}]:${NC}"
+        collect_port_mappings
+
+        LISTENERS_BLOCK+="  - addr: \"0.0.0.0:${l_port}\"\n"
+        LISTENERS_BLOCK+="    transport: \"${V_TRANSPORT}\"\n"
+        [[ -n "$l_cert" ]] && LISTENERS_BLOCK+="    cert_file: \"${l_cert}\"\n    key_file: \"${l_key}\"\n"
+        LISTENERS_BLOCK+="    maps:\n"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && LISTENERS_BLOCK+="    ${line}\n"
+        done <<< "$(echo -e "$MAPPINGS")"
+
+        LISTENER_COUNT=$((LISTENER_COUNT+1))
+        echo -e "${GREEN}  ✓ Listener #${LISTENER_COUNT}: :${l_port} [${V_TRANSPORT}] ${MAP_COUNT} maps${NC}"
+
+        read -p "  Add another listener? [y/N]: " more
+        [[ ! "$more" =~ ^[Yy]$ ]] && break
+    done
+}
+
+# ============================================================================
+# YAML WRITERS
+# ============================================================================
+
+write_server_yaml() {
+    local f="$CONFIG_DIR/server.yaml"
+    
+    # خواندن PSK از فایل
+    if [[ -f "$CONFIG_DIR/psk.key" ]]; then
+        V_PSK=$(cat "$CONFIG_DIR/psk.key")
+    fi
+    
+    cat > "$f" << YAML
+mode: server
+psk: "${V_PSK}"
+profile: "${V_PROFILE}"
+verbose: true
+max_sessions: ${V_MAX_SESS}
+heartbeat: ${V_HEARTBEAT}
+
+listeners:
+YAML
+    echo -e "$LISTENERS_BLOCK" >> "$f"
+    write_shared_config "$f"
+    echo -e "${GREEN}Config: $f${NC}"
+}
+
+write_client_yaml() {
+    local f="$CONFIG_DIR/client.yaml"
+    
+    # خواندن PSK از فایل
+    if [[ -f "$CONFIG_DIR/psk.key" ]]; then
+        V_PSK=$(cat "$CONFIG_DIR/psk.key")
+    fi
+    
+    cat > "$f" << YAML
+mode: client
+psk: "${V_PSK}"
+profile: "${V_PROFILE}"
+verbose: true
+heartbeat: ${V_HEARTBEAT}
+
+${V_PATHS_BLOCK}
+
+load_balancer:
+  strategy: "${V_LB_STRAT}"
+  health_check_sec: ${V_LB_HEALTH}
+  failover_delay_ms: ${V_LB_FAIL_DLY}
+  max_failures: ${V_LB_MAXFAIL}
+  recovery_time_sec: ${V_LB_RECOV}
+  sticky_session: ${V_LB_STICKY}
+YAML
+    write_shared_config "$f"
+    echo -e "${GREEN}Config: $f${NC}"
+}
+
+# ============================================================================
+# SERVER INSTALLER
+# ============================================================================
+
+install_server() {
+    banner
+    mkdir -p "$CONFIG_DIR"
+    echo -e "${CYAN}━━━ Server Setup (Iran) ━━━${NC}"
+    
+    # حالت بدون لایسنس
+    setup_without_license
+    
+    echo "  1) Single Listener (recommended)"
+    echo "  2) Multi-Listener (multiple ports)"
+    echo "  3) Manual (full control)"
+    read -p "  Mode [1]: " inst_mode
+
+    select_profile
+    set_defaults "$V_PROFILE"
+
+    case $inst_mode in
+        2|3)
+            echo ""
+            echo -e "${CYAN}  هر Listener می‌تواند پورت مخصوص خود را داشته باشد${NC}"
+            collect_listeners
+            ;;
+        *)
+            select_transport
+            # پورت پیشفرض 2020
+            read -p "  Tunnel Port [2020]: " lp
+            lp=${lp:-2020}
+            
+            CERT_GENERATED=false
+            local l_cert="" l_key=""
+            read -p "  Use SSL? (y/N): " use_ssl
+            if [[ "$use_ssl" =~ ^[Yy]$ ]]; then
+                read -p "  Cert domain [$V_HTTP_DOM]: " cd; cd=${cd:-$V_HTTP_DOM}
+                gen_cert "$cd"
+                CERT_GENERATED=true
+                l_cert="$CONFIG_DIR/certs/cert.pem"
+                l_key="$CONFIG_DIR/certs/key.pem"
+                V_TRANSPORT="httpsmux"
+            fi
+            
+            echo ""
+            echo -e "${CYAN}━━━ Port Mappings ━━━${NC}"
+            collect_port_mappings
+            
+            LISTENERS_BLOCK="  - addr: \"0.0.0.0:${lp}\"\n    transport: \"${V_TRANSPORT}\"\n"
+            [[ -n "$l_cert" ]] && LISTENERS_BLOCK+="    cert_file: \"${l_cert}\"\n    key_file: \"${l_key}\"\n"
+            LISTENERS_BLOCK+="    maps:\n"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && LISTENERS_BLOCK+="    ${line}\n"
+            done <<< "$(echo -e "$MAPPINGS")"
+            LISTENER_COUNT=1
+            ;;
+    esac
+
+    # Manual mode: advanced editing
+    if [[ "$inst_mode" == "3" ]]; then
+        read -p "  Edit advanced settings? [y/N]: " ea
+        [[ $ea =~ ^[Yy]$ ]] && edit_advanced
+    fi
+
+    write_server_yaml
+    create_service "server"
+
+    echo ""
+    read -p "  Optimize system? [Y/n]: " opt
+    [[ ! $opt =~ ^[Nn]$ ]] && optimize_system
+
+    systemctl enable DaggerConnect-server 2>/dev/null
+    systemctl start DaggerConnect-server
+
+    echo ""
+    echo -e "${GREEN}━━━ Server Ready ━━━${NC}"
+    echo -e "  Listeners: ${GREEN}${LISTENER_COUNT}${NC}"
+    echo -e "  Profile: ${GREEN}${V_PROFILE}${NC}"
+    echo -e "  PSK: ${GREEN}${V_PSK}${NC}"
+    echo -e "  Config: $CONFIG_DIR/server.yaml"
+    echo -e "  Logs: journalctl -u DaggerConnect-server -f"
+    echo ""
+    read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# CLIENT INSTALLER (اتصال به چند سرور خارج)
+# ============================================================================
+
+collect_client_paths() {
+    V_PATHS_BLOCK="paths:"
+    PATH_COUNT=0
+    
+    while true; do
+        echo ""
+        echo -e "${YELLOW}  Server #$((PATH_COUNT+1)) (Kharej)${NC}"
+        
+        select_transport
+        
+        read -p "  Server address (ip:port) [پورت پیشفرض 2020]: " addr
+        [[ -z "$addr" ]] && { echo -e "${RED}  Required${NC}"; continue; }
+        
+        # اضافه کردن پورت 2020 اگر مشخص نشده باشد
+        if [[ ! "$addr" =~ :[0-9]+$ ]]; then
+            addr="${addr}:2020"
+            echo -e "  Using default port: ${GREEN}2020${NC}"
+        fi
+        
+        read -p "  Connection pool [3]: " pool
+        pool=${pool:-3}
+        
+        read -p "  Retry interval sec [2]: " retry
+        retry=${retry:-2}
+        
+        read -p "  Dial timeout sec [15]: " dtout
+        dtout=${dtout:-15}
+        
+        read -p "  Weight (for LB) [1]: " weight
+        weight=${weight:-1}
+        
+        V_PATHS_BLOCK+="
+  - transport: \"${V_TRANSPORT}\"
+    addr: \"${addr}\"
+    connection_pool: ${pool}
+    retry_interval: ${retry}
+    dial_timeout: ${dtout}
+    weight: ${weight}
+    priority: 0"
+        
+        PATH_COUNT=$((PATH_COUNT+1))
+        echo -e "${GREEN}  Added: ${addr} [${V_TRANSPORT}]${NC}"
+        
+        read -p "  Add another server? [y/N]: " m
+        [[ ! "$m" =~ ^[Yy]$ ]] && break
+    done
+}
+
+install_client() {
+    banner
+    mkdir -p "$CONFIG_DIR"
+    echo -e "${CYAN}━━━ Client Setup (Kharej) ━━━${NC}"
+    echo -e "${YELLOW}این سمت می‌تواند به چند سرور ایران متصل شود${NC}"
+    
+    # حالت بدون لایسنس
+    setup_without_license
+
+    select_profile
+    set_defaults "$V_PROFILE"
+    collect_client_paths
+
+    if [[ $PATH_COUNT -gt 1 ]]; then
+        echo ""
+        echo -e "${YELLOW}  Load Balancer Strategy:${NC}"
+        echo "    1) round_robin [default]"
+        echo "    2) least_loaded"
+        echo "    3) failover"
+        echo "    4) weighted_random"
+        read -p "    Choice [1]: " lbc
+        case $lbc in 2) V_LB_STRAT="least_loaded" ;; 3) V_LB_STRAT="failover" ;; 4) V_LB_STRAT="weighted_random" ;; *) V_LB_STRAT="round_robin" ;; esac
+    fi
+
+    read -p "  Edit advanced settings? [y/N]: " ea
+    [[ $ea =~ ^[Yy]$ ]] && edit_advanced
+
+    write_client_yaml
+    create_service "client"
+
+    echo ""
+    read -p "  Optimize system? [Y/n]: " opt
+    [[ ! $opt =~ ^[Nn]$ ]] && optimize_system
+
+    systemctl enable DaggerConnect-client 2>/dev/null
+    systemctl start DaggerConnect-client
+
+    echo ""
+    echo -e "${GREEN}━━━ Client Ready ━━━${NC}"
+    echo -e "  Servers: ${GREEN}${PATH_COUNT}${NC}"
+    echo -e "  LB: ${GREEN}${V_LB_STRAT}${NC}"
+    echo -e "  Profile: ${GREEN}${V_PROFILE}${NC}"
+    echo -e "  PSK: ${GREEN}${V_PSK}${NC}"
+    echo -e "  Config: $CONFIG_DIR/client.yaml"
+    echo -e "  Logs: journalctl -u DaggerConnect-client -f"
+    echo ""
+    read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# UPDATE / UNINSTALL
+# ============================================================================
+
+update_binary() {
+    banner
+    echo -e "${CYAN}━━━ Update Core ━━━${NC}"
+    local cur=$(get_current_version)
+    [[ "$cur" == "not-installed" ]] && { echo -e "${RED}Not installed${NC}"; read -p "Enter..."; main_menu; return; }
+    echo -e "  Current: ${YELLOW}$cur${NC}"
+    read -p "  Continue? [y/N]: " c; [[ ! $c =~ ^[Yy]$ ]] && { main_menu; return; }
+    systemctl stop DaggerConnect-server 2>/dev/null
+    systemctl stop DaggerConnect-client 2>/dev/null
+    download_binary
+    local new=$(get_current_version)
+    echo -e "  Updated: ${GREEN}$new${NC}"
+    systemctl start DaggerConnect-server 2>/dev/null
+    systemctl start DaggerConnect-client 2>/dev/null
+    echo ""
+    read -p "Press Enter..."
+    main_menu
+}
+
+uninstall() {
+    banner
+    echo -e "${RED}━━━ Uninstall DaggerConnect ━━━${NC}"
+    read -p "  Are you sure? [y/N]: " c; [[ ! $c =~ ^[Yy]$ ]] && { main_menu; return; }
+    systemctl stop DaggerConnect-server 2>/dev/null
+    systemctl stop DaggerConnect-client 2>/dev/null
+    systemctl disable DaggerConnect-server 2>/dev/null
+    systemctl disable DaggerConnect-client 2>/dev/null
+    rm -f "$SYSTEMD_DIR/DaggerConnect-server.service" "$SYSTEMD_DIR/DaggerConnect-client.service"
+    rm -f "$INSTALL_DIR/DaggerConnect"
+    rm -rf "$CONFIG_DIR"
+    rm -f /etc/sysctl.d/99-daggerconnect.conf
+    sysctl -p > /dev/null 2>&1
+    systemctl daemon-reload
+    echo -e "${GREEN}Uninstalled${NC}"
+    exit 0
+}
+
+# ============================================================================
+# MAIN MENU
+# ============================================================================
+
+main_menu() {
+    banner
+    local ver=$(get_current_version)
+    [[ "$ver" != "not-installed" ]] && echo -e "  Version: ${GREEN}$ver${NC}" && echo ""
+    echo -e "${CYAN}━━━ Main Menu (HTTP Mux Only) ━━━${NC}"
+    echo ""
+    echo "  1) Install Server (Iran)"
+    echo "  2) Install Client (Kharej - Multi Server)"
+    echo "  3) Update Core"
+    echo "  4) System Optimizer"
+    echo "  5) Change MTU"
+    echo "  6) Change DNS"
+    echo "  7) Uninstall"
+    echo ""
+    echo "  0) Exit"
+    echo ""
+    read -p "  Choice: " c
+    case $c in
+        1) install_server ;;
+        2) install_client ;;
+        3) update_binary ;;
+        4) optimize_system; read -p "Press Enter..."; main_menu ;;
+        5) 
+            read -p "  Enter new MTU [1450]: " new_mtu
+            new_mtu=${new_mtu:-1450}
+            sed -i "s/mtu: [0-9]*/mtu: $new_mtu/" $CONFIG_DIR/*.yaml 2>/dev/null
+            systemctl restart DaggerConnect-server DaggerConnect-client 2>/dev/null
+            echo -e "${GREEN}MTU changed to $new_mtu${NC}"
+            read -p "Press Enter..."
+            main_menu
+            ;;
+        6)
+            read -p "  Enter DNS servers (comma separated) [8.8.8.8,1.1.1.1]: " new_dns
+            new_dns=${new_dns:-"8.8.8.8,1.1.1.1"}
+            echo "nameserver ${new_dns//,/\nnameserver }" > /etc/resolv.conf 2>/dev/null
+            echo -e "${GREEN}DNS changed to $new_dns${NC}"
+            read -p "Press Enter..."
+            main_menu
+            ;;
+        7) uninstall ;;
+        0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
+        *) main_menu ;;
+    esac
+}
+
+# شروع برنامه
+check_root
+banner
+install_deps
+
+if [[ ! -f "$INSTALL_DIR/DaggerConnect" ]]; then
+    echo -e "${YELLOW}DaggerConnect not found. Installing...${NC}"
+    download_binary
+    echo ""
+fi
+
+main_menu
