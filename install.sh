@@ -8,6 +8,34 @@ CONFIG_DIR="/etc/DaggerConnect"
 SYSTEMD_DIR="/etc/systemd/system"
 LATEST_RELEASE_API="https://api.github.com/repos/itsFLoKi/DaggerConnect/releases/latest"
 
+# Detect OS and architecture
+OS_TYPE=""
+ARCH_TYPE=""
+
+detect_os_arch() {
+    echo -e "${YELLOW}[*] Detecting system information...${NC}"
+    
+    # Detect OS
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_TYPE=$ID
+    else
+        OS_TYPE=$(uname -s)
+    fi
+    
+    # Detect architecture
+    ARCH_TYPE=$(uname -m)
+    case $ARCH_TYPE in
+        x86_64)  ARCH_TYPE="amd64" ;;
+        aarch64) ARCH_TYPE="arm64" ;;
+        armv7l)  ARCH_TYPE="armv7" ;;
+        *)       ARCH_TYPE="amd64" ;;  # Default to amd64
+    esac
+    
+    echo -e "  OS: ${GREEN}${OS_TYPE}${NC}"
+    echo -e "  Arch: ${GREEN}${ARCH_TYPE}${NC}"
+}
+
 banner() {
     clear
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -25,13 +53,51 @@ check_root() {
     }
 }
 
-install_dependencies() {
-    echo -e "${YELLOW}[*] Installing dependencies...${NC}"
-    if command -v apt &>/dev/null; then
-        apt update -qq && apt install -y wget curl tar openssl iproute2 dnsutils net-tools > /dev/null 2>&1
-    elif command -v yum &>/dev/null; then
-        yum install -y wget curl tar openssl iproute bind-utils net-tools > /dev/null 2>&1
+install_dependencies_ubuntu() {
+    echo -e "${YELLOW}[*] Installing dependencies for Ubuntu...${NC}"
+    
+    # Update package list
+    apt update -qq
+    
+    # Install required packages
+    DEBIAN_FRONTEND=noninteractive apt install -y \
+        wget \
+        curl \
+        tar \
+        openssl \
+        iproute2 \
+        dnsutils \
+        net-tools \
+        systemd \
+        ufw \
+        fail2ban \
+        nano \
+        htop \
+        > /dev/null 2>&1
+    
+    # Enable systemd-resolved if available
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        systemctl enable systemd-resolved > /dev/null 2>&1
+        systemctl start systemd-resolved > /dev/null 2>&1
     fi
+    
+    echo -e "${GREEN}[✓] Dependencies installed for Ubuntu${NC}"
+}
+
+install_dependencies_general() {
+    echo -e "${YELLOW}[*] Installing dependencies...${NC}"
+    
+    if command -v apt &>/dev/null; then
+        # Ubuntu/Debian
+        apt update -qq
+        DEBIAN_FRONTEND=noninteractive apt install -y \
+            wget curl tar openssl iproute2 dnsutils net-tools systemd ufw fail2ban \
+            > /dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        # CentOS/RHEL
+        yum install -y wget curl tar openssl iproute bind-utils net-tools systemd > /dev/null 2>&1
+    fi
+    
     echo -e "${GREEN}[✓] Dependencies installed${NC}"
 }
 
@@ -39,27 +105,49 @@ download_binary() {
     echo -e "${YELLOW}[*] Downloading DaggerConnect...${NC}"
     mkdir -p "$INSTALL_DIR"
     
+    # Try to get latest version
     LATEST_VERSION=$(curl -s "$LATEST_RELEASE_API" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [[ -z "$LATEST_VERSION" ]] && LATEST_VERSION="v1.4.1"
     
+    # Download URL - try multiple possibilities
     BINARY_URL="https://github.com/itsFLoKi/DaggerConnect/releases/download/${LATEST_VERSION}/DaggerConnect"
-    echo -e "    Version: ${GREEN}${LATEST_VERSION}${NC}"
+    BINARY_URL_ALT="https://github.com/itsFLoKi/DaggerConnect/releases/download/${LATEST_VERSION}/daggerconnect"
+    BINARY_URL_ALT2="https://github.com/itsFLoKi/DaggerConnect/releases/download/${LATEST_VERSION}/DaggerConnect-linux-${ARCH_TYPE}"
     
+    echo -e "    Version: ${GREEN}${LATEST_VERSION}${NC}"
+    echo -e "    Architecture: ${GREEN}${ARCH_TYPE}${NC}"
+    
+    # Backup existing binary
     [[ -f "$INSTALL_DIR/DaggerConnect" ]] && cp "$INSTALL_DIR/DaggerConnect" "$INSTALL_DIR/DaggerConnect.bak"
     
+    # Try to download with different URLs
     if wget -q --show-progress "$BINARY_URL" -O "$INSTALL_DIR/DaggerConnect"; then
         chmod +x "$INSTALL_DIR/DaggerConnect"
-        rm -f "$INSTALL_DIR/DaggerConnect.bak"
         echo -e "${GREEN}[✓] Download complete${NC}"
+    elif wget -q --show-progress "$BINARY_URL_ALT" -O "$INSTALL_DIR/DaggerConnect"; then
+        chmod +x "$INSTALL_DIR/DaggerConnect"
+        echo -e "${GREEN}[✓] Download complete (alt)${NC}"
+    elif wget -q --show-progress "$BINARY_URL_ALT2" -O "$INSTALL_DIR/DaggerConnect"; then
+        chmod +x "$INSTALL_DIR/DaggerConnect"
+        echo -e "${GREEN}[✓] Download complete (arch specific)${NC}"
     else
         echo -e "${RED}[✗] Download failed${NC}"
+        echo -e "${YELLOW}    Please download manually from:${NC}"
+        echo -e "    https://github.com/itsFLoKi/DaggerConnect/releases"
+        
+        # Restore backup if exists
         [[ -f "$INSTALL_DIR/DaggerConnect.bak" ]] && mv "$INSTALL_DIR/DaggerConnect.bak" "$INSTALL_DIR/DaggerConnect"
-        exit 1
+        
+        # Ask user to continue or exit
+        read -p "    Continue without binary? [y/N]: " cont
+        if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
     fi
 }
 
 get_current_version() {
-    if [[ -f "$INSTALL_DIR/DaggerConnect" ]]; then
+    if [[ -f "$INSTALL_DIR/DaggerConnect" ]] && [[ -x "$INSTALL_DIR/DaggerConnect" ]]; then
         "$INSTALL_DIR/DaggerConnect" -v 2>&1 | grep -oP 'v\d+\.\d+' || echo "unknown"
     else
         echo "not-installed"
@@ -102,56 +190,191 @@ EOF
 
     systemctl daemon-reload
     echo -e "${GREEN}[✓] Service created: DaggerConnect-${mode}${NC}"
+    
+    # Enable and start service
+    systemctl enable "DaggerConnect-${mode}" 2>/dev/null
+    systemctl start "DaggerConnect-${mode}" 2>/dev/null
+    
+    # Check if service is running
+    sleep 2
+    if systemctl is-active "DaggerConnect-${mode}" >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓] Service DaggerConnect-${mode} is running${NC}"
+    else
+        echo -e "${YELLOW}[!] Service started but not active. Checking logs:${NC}"
+        journalctl -u "DaggerConnect-${mode}" -n 5 --no-pager
+    fi
 }
 
-optimize_system() {
-    echo -e "${CYAN}━━━ System Optimization ━━━${NC}"
+optimize_system_ubuntu() {
+    echo -e "${CYAN}━━━ Ubuntu System Optimization ━━━${NC}"
     
     # Detect main interface
     MAIN_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
     [[ -z "$MAIN_IFACE" ]] && MAIN_IFACE="eth0"
     echo -e "  Interface: ${GREEN}$MAIN_IFACE${NC}"
 
-    # TCP optimizations for stable multiplexing
-    sysctl -w net.core.rmem_max=33554432 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=33554432 > /dev/null 2>&1
-    sysctl -w net.core.rmem_default=8388608 > /dev/null 2>&1
-    sysctl -w net.core.wmem_default=8388608 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
-    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_notsent_lowat=16384 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
-    
-    # Keepalive optimization
-    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
+    # Increase system limits
+    cat > /etc/security/limits.d/99-daggerconnect.conf << EOF
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
 
-    # Save settings
+    # TCP optimizations
     cat > /etc/sysctl.d/99-daggerconnect.conf << 'EOF'
 # DaggerConnect Optimizations
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.core.rmem_default=8388608
-net.core.wmem_default=8388608
-net.ipv4.tcp_rmem=4096 87380 33554432
-net.ipv4.tcp_wmem=4096 65536 33554432
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-net.ipv4.tcp_notsent_lowat=16384
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=6
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.core.netdev_max_backlog = 5000
+net.core.somaxconn = 4096
+net.core.optmem_max = 25165824
+
+# TCP settings
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+
+# Keepalive
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+# Timeouts
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_recycle = 0
+
+# Other optimizations
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_retries2 = 8
+net.ipv4.ip_local_port_range = 1024 65535
 EOF
 
     sysctl -p /etc/sysctl.d/99-daggerconnect.conf > /dev/null 2>&1
     
-    echo -e "${GREEN}[✓] System optimized for stable connections${NC}"
+    # Configure firewall (UFW)
+    if command -v ufw &>/dev/null; then
+        ufw --force disable > /dev/null 2>&1
+        ufw default deny incoming > /dev/null 2>&1
+        ufw default allow outgoing > /dev/null 2>&1
+        
+        # Allow SSH
+        ufw allow 22/tcp > /dev/null 2>&1
+        
+        # Allow tunnel ports (will be configured later)
+        
+        echo -e "${GREEN}[✓] Firewall (UFW) configured${NC}"
+    fi
+    
+    # Configure fail2ban for SSH protection
+    if command -v fail2ban-server &>/dev/null; then
+        cat > /etc/fail2ban/jail.local << 'EOF'
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+EOF
+        systemctl enable fail2ban > /dev/null 2>&1
+        systemctl restart fail2ban > /dev/null 2>&1
+        echo -e "${GREEN}[✓] fail2ban configured for SSH protection${NC}"
+    fi
+    
+    echo -e "${GREEN}[✓] Ubuntu system optimized${NC}"
+}
+
+optimize_system() {
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        optimize_system_ubuntu
+    else
+        # Generic optimization
+        echo -e "${CYAN}━━━ System Optimization ━━━${NC}"
+        
+        MAIN_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+        [[ -z "$MAIN_IFACE" ]] && MAIN_IFACE="eth0"
+        echo -e "  Interface: ${GREEN}$MAIN_IFACE${NC}"
+
+        sysctl -w net.core.rmem_max=33554432 > /dev/null 2>&1
+        sysctl -w net.core.wmem_max=33554432 > /dev/null 2>&1
+        sysctl -w net.core.rmem_default=8388608 > /dev/null 2>&1
+        sysctl -w net.core.wmem_default=8388608 > /dev/null 2>&1
+        sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
+        sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+        
+        cat > /etc/sysctl.d/99-daggerconnect.conf << 'EOF'
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+EOF
+        sysctl -p /etc/sysctl.d/99-daggerconnect.conf > /dev/null 2>&1
+        echo -e "${GREEN}[✓] System optimized${NC}"
+    fi
+}
+
+# ============================================================================
+# DNS MANAGEMENT
+# ============================================================================
+
+set_dns_servers() {
+    local dns_servers=$1
+    
+    if [[ -z "$dns_servers" ]]; then
+        return
+    fi
+    
+    echo -e "${YELLOW}[*] Setting DNS servers...${NC}"
+    
+    # For Ubuntu 18.04+ with systemd-resolved
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        IFS=',' read -ra DNS_LIST <<< "$dns_servers"
+        for dns in "${DNS_LIST[@]}"; do
+            dns=$(echo "$dns" | tr -d ' ')
+            resolvectl dns eth0 "$dns" 2>/dev/null || \
+            resolvectl dns "$dns" 2>/dev/null || true
+        done
+        echo -e "${GREEN}[✓] DNS set via systemd-resolved${NC}"
+    
+    # For older Ubuntu or other systems
+    elif [[ -f /etc/resolv.conf ]]; then
+        # Check if resolv.conf is managed by systemd
+        if [[ -L /etc/resolv.conf ]] && [[ "$(readlink /etc/resolv.conf)" == "../run/systemd/resolve/stub-resolv.conf" ]]; then
+            echo -e "${YELLOW}[!] resolv.conf is managed by systemd-resolved${NC}"
+            echo -e "    To change DNS, edit: /etc/systemd/resolved.conf"
+        else
+            # Backup current resolv.conf
+            cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null
+            
+            # Write new DNS servers
+            > /etc/resolv.conf
+            IFS=',' read -ra DNS_LIST <<< "$dns_servers"
+            for dns in "${DNS_LIST[@]}"; do
+                dns=$(echo "$dns" | tr -d ' ')
+                echo "nameserver $dns" >> /etc/resolv.conf
+            done
+            echo -e "${GREEN}[✓] DNS updated in /etc/resolv.conf${NC}"
+        fi
+    else
+        echo -e "${YELLOW}[!] Cannot modify DNS automatically. Please set manually:${NC}"
+        echo -e "    Add these nameservers: $dns_servers"
+    fi
 }
 
 # ============================================================================
@@ -180,7 +403,7 @@ setup_psk() {
 }
 
 # ============================================================================
-# PORT MAPPING COLLECTOR (with comma support)
+# PORT MAPPING COLLECTOR
 # ============================================================================
 
 collect_port_mappings() {
@@ -239,7 +462,7 @@ collect_port_mappings() {
                 fi
             done
         
-        # Range with mapping (e.g., 1000-1010=2000-2010)
+        # Range with mapping
         elif [[ "$port_input" =~ ^([0-9]+)-([0-9]+)=([0-9]+)-([0-9]+)$ ]]; then
             start1=${BASH_REMATCH[1]}
             end1=${BASH_REMATCH[2]}
@@ -255,7 +478,7 @@ collect_port_mappings() {
                 echo -e "${RED}    Error: Range sizes don't match${NC}"
             fi
         
-        # Simple range (e.g., 1000-2000)
+        # Simple range
         elif [[ "$port_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             start=${BASH_REMATCH[1]}
             end=${BASH_REMATCH[2]}
@@ -269,7 +492,7 @@ collect_port_mappings() {
                 echo -e "${RED}    Error: Invalid range${NC}"
             fi
         
-        # Custom mapping (e.g., 5000=8080)
+        # Custom mapping
         elif [[ "$port_input" =~ ^([0-9]+)=([0-9]+)$ ]]; then
             bind_port=${BASH_REMATCH[1]}
             target_port=${BASH_REMATCH[2]}
@@ -312,7 +535,6 @@ set_profile_defaults() {
     
     case $profile in
         aggressive)
-            # Aggressive profile - maximum throughput
             SMUX_KEEPALIVE=3
             SMUX_MAX_RECV=33554432
             SMUX_MAX_STREAM=33554432
@@ -325,7 +547,6 @@ set_profile_defaults() {
             TCP_KEEPALIVE=20
             ;;
         latency)
-            # Latency profile - optimized for gaming/voip
             SMUX_KEEPALIVE=5
             SMUX_MAX_RECV=16777216
             SMUX_MAX_STREAM=16777216
@@ -338,7 +559,6 @@ set_profile_defaults() {
             TCP_KEEPALIVE=30
             ;;
         *)
-            # Balanced profile - default
             SMUX_KEEPALIVE=4
             SMUX_MAX_RECV=25165824
             SMUX_MAX_STREAM=25165824
@@ -352,31 +572,22 @@ set_profile_defaults() {
             ;;
     esac
     
-    # Common settings
     SMUX_VERSION=2
     KCP_NODELAY=1
     KCP_RESEND=2
     KCP_NC=1
-    
-    # Advanced TCP settings
     TCP_NODELAY=true
     TCP_READ_BUFFER=16777216
     TCP_WRITE_BUFFER=16777216
     MAX_CONNECTIONS=10000
     CONNECTION_TIMEOUT=60
     STREAM_TIMEOUT=300
-    
-    # Obfuscation
     OBFUSCATION=true
     OBFUSCATION_MIN_PAD=32
     OBFUSCATION_MAX_PAD=1024
-    
-    # HTTP mimic
     FAKE_DOMAIN="www.google.com"
     FAKE_PATH="/search"
     USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    
-    # Load balancer (for client)
     LB_STRATEGY="round_robin"
     LB_HEALTH_CHECK=15
     LB_FAILOVER_DELAY=1000
@@ -423,7 +634,7 @@ edit_advanced_settings() {
 }
 
 # ============================================================================
-# TRANSPORT SELECTOR (HTTP Mux only)
+# TRANSPORT SELECTOR
 # ============================================================================
 
 select_transport() {
@@ -460,15 +671,6 @@ select_profile() {
 
 write_shared_config() {
     local config_file=$1
-    
-    # Update DNS if specified
-    if [[ -n "$DNS_SERVERS" ]]; then
-        > /etc/resolv.conf
-        IFS=',' read -ra DNS_LIST <<< "$DNS_SERVERS"
-        for dns in "${DNS_LIST[@]}"; do
-            echo "nameserver $dns" >> /etc/resolv.conf
-        done
-    fi
     
     cat >> "$config_file" << YAML
 
@@ -526,7 +728,6 @@ collect_listeners() {
 
         select_transport
         
-        # Default port 2020
         local default_port=2020
         [[ $LISTENER_COUNT -gt 0 ]] && default_port=$((2020 + LISTENER_COUNT))
         
@@ -584,7 +785,6 @@ collect_listeners() {
 write_server_config() {
     local config_file="$CONFIG_DIR/server.yaml"
     
-    # Read PSK from file
     if [[ -f "$CONFIG_DIR/psk.key" ]]; then
         PSK_VALUE=$(cat "$CONFIG_DIR/psk.key")
     fi
@@ -607,7 +807,7 @@ YAML
 }
 
 # ============================================================================
-# COLLECT CLIENT PATHS (Multi-server support)
+# COLLECT CLIENT PATHS
 # ============================================================================
 
 collect_client_paths() {
@@ -623,7 +823,6 @@ collect_client_paths() {
         read -p "  Server address (IP or domain): " server_addr
         [[ -z "$server_addr" ]] && { echo -e "${RED}    Error: Address required${NC}"; continue; }
         
-        # Add default port 2020 if not specified
         if [[ ! "$server_addr" =~ :[0-9]+$ ]]; then
             server_addr="${server_addr}:2020"
             echo -e "    Using default port: ${GREEN}2020${NC}"
@@ -665,7 +864,6 @@ collect_client_paths() {
 write_client_config() {
     local config_file="$CONFIG_DIR/client.yaml"
     
-    # Read PSK from file
     if [[ -f "$CONFIG_DIR/psk.key" ]]; then
         PSK_VALUE=$(cat "$CONFIG_DIR/psk.key")
     fi
@@ -766,15 +964,33 @@ install_server() {
         [[ $edit_adv =~ ^[Yy]$ ]] && edit_advanced_settings
     fi
 
+    if [[ -n "$DNS_SERVERS" ]]; then
+        set_dns_servers "$DNS_SERVERS"
+    fi
+
     write_server_config
     create_systemd_service "server"
+
+    # Configure firewall for tunnel ports
+    if command -v ufw &>/dev/null; then
+        echo -e "${YELLOW}[*] Configuring firewall...${NC}"
+        
+        # Extract all listen ports from LISTENERS_BLOCK
+        while IFS= read -r line; do
+            if [[ "$line" =~ addr:\ \"0.0.0.0:([0-9]+)\" ]]; then
+                port="${BASH_REMATCH[1]}"
+                ufw allow "$port/tcp" > /dev/null 2>&1
+                echo -e "  ${GREEN}✓ Allowed port $port/tcp${NC}"
+            fi
+        done <<< "$(echo -e "$LISTENERS_BLOCK")"
+        
+        ufw --force enable > /dev/null 2>&1
+        echo -e "${GREEN}[✓] Firewall configured${NC}"
+    fi
 
     echo ""
     read -p "  Optimize system? [Y/n]: " optimize_choice
     [[ ! $optimize_choice =~ ^[Nn]$ ]] && optimize_system
-
-    systemctl enable DaggerConnect-server 2>/dev/null
-    systemctl start DaggerConnect-server
 
     echo ""
     echo -e "${GREEN}━━━ Server Installation Complete ━━━${NC}"
@@ -782,9 +998,15 @@ install_server() {
     echo -e "  Profile: ${GREEN}${PROFILE}${NC}"
     echo -e "  PSK: ${GREEN}${PSK_VALUE}${NC}"
     echo -e "  Config: ${CYAN}$CONFIG_DIR/server.yaml${NC}"
+    echo -e "  Service: ${CYAN}systemctl status DaggerConnect-server${NC}"
     echo -e "  Logs: ${CYAN}journalctl -u DaggerConnect-server -f${NC}"
     echo ""
     
+    # Show service status
+    sleep 2
+    systemctl status DaggerConnect-server --no-pager -l
+    
+    echo ""
     read -p "Press Enter to continue..."
     main_menu
 }
@@ -827,15 +1049,16 @@ install_client() {
     read -p "  Edit advanced settings? [y/N]: " edit_adv
     [[ $edit_adv =~ ^[Yy]$ ]] && edit_advanced_settings
 
+    if [[ -n "$DNS_SERVERS" ]]; then
+        set_dns_servers "$DNS_SERVERS"
+    fi
+
     write_client_config
     create_systemd_service "client"
 
     echo ""
     read -p "  Optimize system? [Y/n]: " optimize_choice
     [[ ! $optimize_choice =~ ^[Nn]$ ]] && optimize_system
-
-    systemctl enable DaggerConnect-client 2>/dev/null
-    systemctl start DaggerConnect-client
 
     echo ""
     echo -e "${GREEN}━━━ Client Installation Complete ━━━${NC}"
@@ -844,11 +1067,39 @@ install_client() {
     echo -e "  Profile: ${GREEN}${PROFILE}${NC}"
     echo -e "  PSK: ${GREEN}${PSK_VALUE}${NC}"
     echo -e "  Config: ${CYAN}$CONFIG_DIR/client.yaml${NC}"
+    echo -e "  Service: ${CYAN}systemctl status DaggerConnect-client${NC}"
     echo -e "  Logs: ${CYAN}journalctl -u DaggerConnect-client -f${NC}"
     echo ""
     
+    # Show service status
+    sleep 2
+    systemctl status DaggerConnect-client --no-pager -l
+    
+    echo ""
     read -p "Press Enter to continue..."
     main_menu
+}
+
+# ============================================================================
+# CHECK SERVICE STATUS
+# ============================================================================
+
+check_service_status() {
+    echo -e "${CYAN}━━━ Service Status ━━━${NC}"
+    
+    if systemctl is-active DaggerConnect-server >/dev/null 2>&1; then
+        echo -e "  Server: ${GREEN}● Running${NC}"
+    else
+        echo -e "  Server: ${RED}○ Stopped${NC}"
+    fi
+    
+    if systemctl is-active DaggerConnect-client >/dev/null 2>&1; then
+        echo -e "  Client: ${GREEN}● Running${NC}"
+    else
+        echo -e "  Client: ${RED}○ Stopped${NC}"
+    fi
+    
+    echo ""
 }
 
 # ============================================================================
@@ -899,7 +1150,6 @@ update_core() {
 change_mtu() {
     echo ""
     echo -e "${CYAN}━━━ Change MTU ━━━${NC}"
-    echo -e "Current MTU values in configs:"
     
     if [[ -f "$CONFIG_DIR/server.yaml" ]]; then
         current_mtu=$(grep -oP 'mtu: \K\d+' "$CONFIG_DIR/server.yaml" 2>/dev/null)
@@ -918,7 +1168,15 @@ change_mtu() {
     if [[ "$new_mtu" =~ ^[0-9]+$ ]] && [ "$new_mtu" -ge 576 ] && [ "$new_mtu" -le 1500 ]; then
         sed -i "s/mtu: [0-9]*/mtu: $new_mtu/" $CONFIG_DIR/*.yaml 2>/dev/null
         systemctl restart DaggerConnect-server DaggerConnect-client 2>/dev/null
-        echo -e "${GREEN}[✓] MTU changed to $new_mtu${NC}"
+        
+        # Check if services restarted successfully
+        sleep 2
+        if systemctl is-active DaggerConnect-server >/dev/null 2>&1; then
+            echo -e "${GREEN}[✓] Server restarted with MTU $new_mtu${NC}"
+        fi
+        if systemctl is-active DaggerConnect-client >/dev/null 2>&1; then
+            echo -e "${GREEN}[✓] Client restarted with MTU $new_mtu${NC}"
+        fi
     else
         echo -e "${RED}Error: Invalid MTU value (must be 576-1500)${NC}"
     fi
@@ -935,30 +1193,69 @@ change_mtu() {
 change_dns() {
     echo ""
     echo -e "${CYAN}━━━ Change DNS ━━━${NC}"
-    echo -e "Current DNS servers:"
     
-    if [[ -f /etc/resolv.conf ]]; then
-        grep "^nameserver" /etc/resolv.conf | while read line; do
-            echo -e "  ${GREEN}$line${NC}"
-        done
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        echo -e "Current DNS (systemd-resolved):"
+        resolvectl status | grep "DNS Servers" -A 2 || true
+    else
+        echo -e "Current DNS (/etc/resolv.conf):"
+        grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  No DNS configured"
     fi
     
     echo ""
     read -p "  Enter DNS servers (comma separated) [8.8.8.8,1.1.1.1]: " new_dns
     new_dns=${new_dns:-"8.8.8.8,1.1.1.1"}
     
-    # Update resolv.conf
-    > /etc/resolv.conf
-    IFS=',' read -ra DNS_LIST <<< "$new_dns"
-    for dns in "${DNS_LIST[@]}"; do
-        dns=$(echo "$dns" | tr -d ' ')
-        echo "nameserver $dns" >> /etc/resolv.conf
-    done
+    set_dns_servers "$new_dns"
     
-    echo -e "${GREEN}[✓] DNS updated${NC}"
     echo ""
-    
     read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# RESTART SERVICES
+# ============================================================================
+
+restart_services() {
+    echo -e "${CYAN}━━━ Restart Services ━━━${NC}"
+    
+    if systemctl is-active DaggerConnect-server >/dev/null 2>&1; then
+        systemctl restart DaggerConnect-server
+        echo -e "${GREEN}[✓] Server restarted${NC}"
+    fi
+    
+    if systemctl is-active DaggerConnect-client >/dev/null 2>&1; then
+        systemctl restart DaggerConnect-client
+        echo -e "${GREEN}[✓] Client restarted${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# SHOW LOGS
+# ============================================================================
+
+show_logs() {
+    echo -e "${CYAN}━━━ Service Logs ━━━${NC}"
+    echo "  1) Server logs"
+    echo "  2) Client logs"
+    echo "  3) Both"
+    echo "  0) Back"
+    
+    read -p "  Choice: " log_choice
+    
+    case $log_choice in
+        1) journalctl -u DaggerConnect-server -f ;;
+        2) journalctl -u DaggerConnect-client -f ;;
+        3) journalctl -u DaggerConnect-server -u DaggerConnect-client -f ;;
+        0) main_menu ;;
+        *) main_menu ;;
+    esac
+    
     main_menu
 }
 
@@ -999,6 +1296,11 @@ uninstall() {
     rm -f /etc/sysctl.d/99-daggerconnect.conf
     sysctl -p > /dev/null 2>&1
     
+    # Remove firewall rules (if UFW)
+    if command -v ufw &>/dev/null; then
+        ufw delete allow 2020/tcp > /dev/null 2>&1
+    fi
+    
     systemctl daemon-reload
     
     echo -e "${GREEN}[✓] DaggerConnect uninstalled successfully${NC}"
@@ -1015,7 +1317,7 @@ main_menu() {
     local current_version=$(get_current_version)
     if [[ "$current_version" != "not-installed" ]]; then
         echo -e "  Installed version: ${GREEN}$current_version${NC}"
-        echo ""
+        check_service_status
     fi
     
     echo -e "${CYAN}━━━ Main Menu (HTTP Mux Only) ━━━${NC}"
@@ -1026,7 +1328,9 @@ main_menu() {
     echo "  4) System Optimizer"
     echo "  5) Change MTU"
     echo "  6) Change DNS"
-    echo "  7) Uninstall"
+    echo "  7) Restart Services"
+    echo "  8) View Logs"
+    echo "  9) Uninstall"
     echo ""
     echo "  0) Exit"
     echo ""
@@ -1040,7 +1344,9 @@ main_menu() {
         4) optimize_system; read -p "Press Enter..."; main_menu ;;
         5) change_mtu ;;
         6) change_dns ;;
-        7) uninstall ;;
+        7) restart_services ;;
+        8) show_logs ;;
+        9) uninstall ;;
         0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
         *) main_menu ;;
     esac
@@ -1053,11 +1359,18 @@ main_menu() {
 # Check root privileges
 check_root
 
+# Detect OS and architecture
+detect_os_arch
+
 # Show banner
 banner
 
-# Install dependencies if needed
-install_dependencies
+# Install dependencies based on OS
+if [[ "$OS_TYPE" == "ubuntu" ]]; then
+    install_dependencies_ubuntu
+else
+    install_dependencies_general
+fi
 
 # Download binary if not present
 if [[ ! -f "$INSTALL_DIR/DaggerConnect" ]]; then
