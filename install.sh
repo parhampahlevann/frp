@@ -13,37 +13,46 @@ banner() {
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}       DaggerConnect Optimized v2.0${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}  Only HTTP Mux + License-Free${NC}"
+    echo -e "${BLUE}  HTTP Mux Only - License Free${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 }
 
-check_root() { [[ $EUID -ne 0 ]] && { echo -e "${RED}Run as root${NC}"; exit 1; }; }
+check_root() { 
+    [[ $EUID -ne 0 ]] && { 
+        echo -e "${RED}Error: This script must be run as root${NC}"
+        exit 1
+    }
+}
 
-install_deps() {
-    echo -e "${YELLOW}Installing dependencies...${NC}"
+install_dependencies() {
+    echo -e "${YELLOW}[*] Installing dependencies...${NC}"
     if command -v apt &>/dev/null; then
-        apt update -qq && apt install -y wget curl tar openssl iproute2 dnsutils > /dev/null 2>&1
+        apt update -qq && apt install -y wget curl tar openssl iproute2 dnsutils net-tools > /dev/null 2>&1
     elif command -v yum &>/dev/null; then
-        yum install -y wget curl tar openssl iproute2 bind-utils > /dev/null 2>&1
+        yum install -y wget curl tar openssl iproute bind-utils net-tools > /dev/null 2>&1
     fi
-    echo -e "${GREEN}Done${NC}"
+    echo -e "${GREEN}[✓] Dependencies installed${NC}"
 }
 
 download_binary() {
-    echo -e "${YELLOW}Downloading DaggerConnect...${NC}"
+    echo -e "${YELLOW}[*] Downloading DaggerConnect...${NC}"
     mkdir -p "$INSTALL_DIR"
+    
     LATEST_VERSION=$(curl -s "$LATEST_RELEASE_API" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [[ -z "$LATEST_VERSION" ]] && LATEST_VERSION="v1.4.1"
+    
     BINARY_URL="https://github.com/itsFLoKi/DaggerConnect/releases/download/${LATEST_VERSION}/DaggerConnect"
-    echo -e "  Version: ${GREEN}${LATEST_VERSION}${NC}"
+    echo -e "    Version: ${GREEN}${LATEST_VERSION}${NC}"
+    
     [[ -f "$INSTALL_DIR/DaggerConnect" ]] && cp "$INSTALL_DIR/DaggerConnect" "$INSTALL_DIR/DaggerConnect.bak"
+    
     if wget -q --show-progress "$BINARY_URL" -O "$INSTALL_DIR/DaggerConnect"; then
         chmod +x "$INSTALL_DIR/DaggerConnect"
         rm -f "$INSTALL_DIR/DaggerConnect.bak"
-        echo -e "${GREEN}Downloaded${NC}"
+        echo -e "${GREEN}[✓] Download complete${NC}"
     else
-        echo -e "${RED}Download failed${NC}"
+        echo -e "${RED}[✗] Download failed${NC}"
         [[ -f "$INSTALL_DIR/DaggerConnect.bak" ]] && mv "$INSTALL_DIR/DaggerConnect.bak" "$INSTALL_DIR/DaggerConnect"
         exit 1
     fi
@@ -57,22 +66,25 @@ get_current_version() {
     fi
 }
 
-gen_cert() {
+generate_certificate() {
     local domain=${1:-www.google.com}
     mkdir -p "$CONFIG_DIR/certs"
+    
     openssl req -x509 -newkey rsa:4096 \
         -keyout "$CONFIG_DIR/certs/key.pem" \
         -out "$CONFIG_DIR/certs/cert.pem" \
         -days 365 -nodes \
-        -subj "/C=US/ST=CA/L=SF/O=Corp/CN=${domain}" 2>/dev/null
-    echo -e "${GREEN}Certificate generated (${domain})${NC}"
+        -subj "/C=US/ST=CA/L=San Francisco/O=Corp/CN=${domain}" 2>/dev/null
+    
+    echo -e "${GREEN}[✓] SSL certificate generated for ${domain}${NC}"
 }
 
-create_service() {
+create_systemd_service() {
     local mode=$1
+    
     cat > "$SYSTEMD_DIR/DaggerConnect-${mode}.service" << EOF
 [Unit]
-Description=DaggerConnect ${mode}
+Description=DaggerConnect ${mode} Service
 After=network.target
 
 [Service]
@@ -81,328 +93,342 @@ User=root
 WorkingDirectory=$CONFIG_DIR
 ExecStart=$INSTALL_DIR/DaggerConnect -c $CONFIG_DIR/${mode}.yaml
 Restart=always
-RestartSec=3
+RestartSec=5
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    echo -e "${GREEN}Service DaggerConnect-${mode} created${NC}"
+    echo -e "${GREEN}[✓] Service created: DaggerConnect-${mode}${NC}"
 }
 
 optimize_system() {
     echo -e "${CYAN}━━━ System Optimization ━━━${NC}"
-    IFACE=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
-    [[ -z "$IFACE" ]] && IFACE="eth0"
-    echo -e "  Interface: ${GREEN}$IFACE${NC}"
+    
+    # Detect main interface
+    MAIN_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+    [[ -z "$MAIN_IFACE" ]] && MAIN_IFACE="eth0"
+    echo -e "  Interface: ${GREEN}$MAIN_IFACE${NC}"
 
-    # بهینه‌سازی برای TCP Mux بدون قطعی
-    sysctl -w net.core.rmem_max=16777216 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=16777216 > /dev/null 2>&1
-    sysctl -w net.core.rmem_default=4194304 > /dev/null 2>&1
-    sysctl -w net.core.wmem_default=4194304 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_retries2=8 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_syn_retries=3 > /dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=5000 > /dev/null 2>&1
-    sysctl -w net.core.somaxconn=4096 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
+    # TCP optimizations for stable multiplexing
+    sysctl -w net.core.rmem_max=33554432 > /dev/null 2>&1
+    sysctl -w net.core.wmem_max=33554432 > /dev/null 2>&1
+    sysctl -w net.core.rmem_default=8388608 > /dev/null 2>&1
+    sysctl -w net.core.wmem_default=8388608 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
+    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_notsent_lowat=16384 > /dev/null 2>&1
     sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
     sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
+    
+    # Keepalive optimization
     sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
     sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=5 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fin_timeout=20 > /dev/null 2>&1
-    
-    # فعال کردن BBR
-    modprobe tcp_bbr 2>/dev/null && {
-        sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
-        sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    }
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
 
-    cat > /etc/sysctl.d/99-daggerconnect.conf << 'SYSEOF'
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.core.rmem_default=4194304
-net.core.wmem_default=4194304
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_retries2=8
-net.ipv4.tcp_syn_retries=3
-net.core.netdev_max_backlog=5000
-net.core.somaxconn=4096
-net.ipv4.tcp_fastopen=3
+    # Save settings
+    cat > /etc/sysctl.d/99-daggerconnect.conf << 'EOF'
+# DaggerConnect Optimizations
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+net.ipv4.tcp_notsent_lowat=16384
 net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=5
-net.ipv4.tcp_fin_timeout=20
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-SYSEOF
-    echo -e "${GREEN}System optimized for stable TCP Mux${NC}"
+net.ipv4.tcp_keepalive_probes=6
+EOF
+
+    sysctl -p /etc/sysctl.d/99-daggerconnect.conf > /dev/null 2>&1
+    
+    echo -e "${GREEN}[✓] System optimized for stable connections${NC}"
 }
 
 # ============================================================================
-# LICENSE-FREE SETUP (بدون لایسنس)
+# LICENSE-FREE SETUP (PSK Only)
 # ============================================================================
 
-setup_without_license() {
+setup_psk() {
     echo ""
-    echo -e "${CYAN}━━━ License-Free Mode (PSK Only) ━━━${NC}"
-    echo -e "${YELLOW}در این حالت فقط از PSK برای احراز هویت استفاده می‌شود${NC}"
+    echo -e "${CYAN}━━━ License-Free Setup (PSK Only) ━━━${NC}"
     
     while true; do
-        read -sp "  Enter PSK (حداقل 8 کاراکتر): " V_PSK
+        read -sp "  Enter PSK (minimum 8 characters): " PSK_VALUE
         echo ""
-        if [[ ${#V_PSK} -ge 8 ]]; then
+        if [[ ${#PSK_VALUE} -ge 8 ]]; then
             break
         else
-            echo -e "${RED}PSK باید حداقل 8 کاراکتر باشد${NC}"
+            echo -e "${RED}  PSK must be at least 8 characters${NC}"
         fi
     done
     
-    # ذخیره PSK در فایل
-    echo "$V_PSK" > "$CONFIG_DIR/psk.key"
+    # Save PSK to file
+    echo "$PSK_VALUE" > "$CONFIG_DIR/psk.key"
     chmod 600 "$CONFIG_DIR/psk.key"
     
-    echo -e "${GREEN}✓ PSK تنظیم شد${NC}"
+    echo -e "${GREEN}[✓] PSK configured successfully${NC}"
 }
 
 # ============================================================================
-# PORT MAPPING COLLECTOR (با پشتیبانی از کاما)
+# PORT MAPPING COLLECTOR (with comma support)
 # ============================================================================
 
 collect_port_mappings() {
     MAPPINGS=""
     MAP_COUNT=0
-    echo -e "  ${GREEN}Single${NC}: 8008  ${GREEN}Range${NC}: 1000/2000  ${GREEN}Custom${NC}: 5000=8008"
-    echo -e "  ${GREEN}Comma${NC}: 80,443,8080  ${GREEN}RangeMap${NC}: 1000/1010=2000/2010"
+    
+    echo -e "  ${GREEN}Examples:${NC}"
+    echo -e "  • Single: ${YELLOW}8080${NC}"
+    echo -e "  • Range: ${YELLOW}1000-2000${NC}"
+    echo -e "  • Custom: ${YELLOW}5000=8080${NC}"
+    echo -e "  • Comma: ${YELLOW}80,443,8080${NC}"
+    echo -e "  • Range Map: ${YELLOW}1000-1010=2000-2010${NC}"
     echo ""
     
     while true; do
         echo -e "${YELLOW}  Mapping #$((MAP_COUNT+1))${NC}"
-        echo "    1) tcp  2) udp  3) both"
-        read -p "    Protocol [1]: " pc
-        case $pc in 2) proto="udp" ;; 3) proto="both" ;; *) proto="tcp" ;; esac
+        echo "    1) TCP  2) UDP  3) Both"
+        read -p "    Protocol [1]: " proto_choice
         
-        read -p "    Port(s) (می‌توانید با کاما جدا کنید): " pinput
-        [[ -z "$pinput" ]] && { echo -e "${RED}    Empty${NC}"; continue; }
+        case $proto_choice in
+            2) PROTO="udp" ;;
+            3) PROTO="both" ;;
+            *) PROTO="tcp" ;;
+        esac
         
-        pinput=$(echo "$pinput" | tr -d ' ')
-        local bip="0.0.0.0" tip="127.0.0.1"
+        read -p "    Port(s): " port_input
+        [[ -z "$port_input" ]] && { echo -e "${RED}    Error: Port required${NC}"; continue; }
         
-        _add() {
-            local t=$1 bp=$2 tp=$3
-            if [[ "$t" == "both" ]]; then
-                MAPPINGS+="  - type: tcp\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
-                MAPPINGS+="  - type: udp\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
+        port_input=$(echo "$port_input" | tr -d ' ')
+        local bind_ip="0.0.0.0"
+        local target_ip="127.0.0.1"
+        
+        _add_mapping() {
+            local proto=$1
+            local bind_port=$2
+            local target_port=$3
+            
+            if [[ "$proto" == "both" ]]; then
+                MAPPINGS+="  - type: tcp\n    bind: \"${bind_ip}:${bind_port}\"\n    target: \"${target_ip}:${target_port}\"\n"
+                MAPPINGS+="  - type: udp\n    bind: \"${bind_ip}:${bind_port}\"\n    target: \"${target_ip}:${target_port}\"\n"
                 MAP_COUNT=$((MAP_COUNT+2))
             else
-                MAPPINGS+="  - type: ${t}\n    bind: \"${bip}:${bp}\"\n    target: \"${tip}:${tp}\"\n"
+                MAPPINGS+="  - type: ${proto}\n    bind: \"${bind_ip}:${bind_port}\"\n    target: \"${target_ip}:${target_port}\"\n"
                 MAP_COUNT=$((MAP_COUNT+1))
             fi
         }
         
-        # پشتیبانی از کاما
-        if [[ "$pinput" == *","* ]]; then
-            IFS=',' read -ra PORTS <<< "$pinput"
+        # Comma separated ports
+        if [[ "$port_input" == *","* ]]; then
+            IFS=',' read -ra PORTS <<< "$port_input"
             for port in "${PORTS[@]}"; do
                 port=$(echo "$port" | tr -d ' ')
-                if [[ "$port" =~ ^[0-9]+$ ]]; then
-                    _add "$proto" "$port" "$port"
-                    echo -e "${GREEN}    ${port} -> ${port}${NC}"
+                if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+                    _add_mapping "$PROTO" "$port" "$port"
+                    echo -e "${GREEN}    ✓ Port $port mapped${NC}"
                 fi
             done
-        elif [[ "$pinput" =~ ^([0-9]+)/([0-9]+)=([0-9]+)/([0-9]+)$ ]]; then
-            for ((i=0; i<=${BASH_REMATCH[2]}-${BASH_REMATCH[1]}; i++)); do
-                _add "$proto" $(( ${BASH_REMATCH[1]}+i )) $(( ${BASH_REMATCH[3]}+i ))
-            done
-            echo -e "${GREEN}    Range map added${NC}"
-        elif [[ "$pinput" =~ ^([0-9]+)/([0-9]+)$ ]]; then
-            for ((p=${BASH_REMATCH[1]}; p<=${BASH_REMATCH[2]}; p++)); do _add "$proto" $p $p; done
-            echo -e "${GREEN}    Range added${NC}"
-        elif [[ "$pinput" =~ ^([0-9]+)=([0-9]+)$ ]]; then
-            _add "$proto" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-            echo -e "${GREEN}    ${BASH_REMATCH[1]} -> ${BASH_REMATCH[2]}${NC}"
-        elif [[ "$pinput" =~ ^[0-9]+$ ]]; then
-            _add "$proto" "$pinput" "$pinput"
-            echo -e "${GREEN}    ${pinput} -> ${pinput}${NC}"
+        
+        # Range with mapping (e.g., 1000-1010=2000-2010)
+        elif [[ "$port_input" =~ ^([0-9]+)-([0-9]+)=([0-9]+)-([0-9]+)$ ]]; then
+            start1=${BASH_REMATCH[1]}
+            end1=${BASH_REMATCH[2]}
+            start2=${BASH_REMATCH[3]}
+            end2=${BASH_REMATCH[4]}
+            
+            if [ $((end1-start1)) -eq $((end2-start2)) ]; then
+                for ((i=0; i<=end1-start1; i++)); do
+                    _add_mapping "$PROTO" $((start1+i)) $((start2+i))
+                done
+                echo -e "${GREEN}    ✓ Range map added ($((end1-start1+1)) ports)${NC}"
+            else
+                echo -e "${RED}    Error: Range sizes don't match${NC}"
+            fi
+        
+        # Simple range (e.g., 1000-2000)
+        elif [[ "$port_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start=${BASH_REMATCH[1]}
+            end=${BASH_REMATCH[2]}
+            
+            if [ "$start" -lt "$end" ] && [ "$end" -le 65535 ]; then
+                for ((p=start; p<=end; p++)); do
+                    _add_mapping "$PROTO" $p $p
+                done
+                echo -e "${GREEN}    ✓ Range added ($((end-start+1)) ports)${NC}"
+            else
+                echo -e "${RED}    Error: Invalid range${NC}"
+            fi
+        
+        # Custom mapping (e.g., 5000=8080)
+        elif [[ "$port_input" =~ ^([0-9]+)=([0-9]+)$ ]]; then
+            bind_port=${BASH_REMATCH[1]}
+            target_port=${BASH_REMATCH[2]}
+            
+            if [ "$bind_port" -ge 1 ] && [ "$bind_port" -le 65535 ] && [ "$target_port" -ge 1 ] && [ "$target_port" -le 65535 ]; then
+                _add_mapping "$PROTO" "$bind_port" "$target_port"
+                echo -e "${GREEN}    ✓ ${bind_port} -> ${target_port}${NC}"
+            else
+                echo -e "${RED}    Error: Invalid port number${NC}"
+            fi
+        
+        # Single port
+        elif [[ "$port_input" =~ ^[0-9]+$ ]] && [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ]; then
+            _add_mapping "$PROTO" "$port_input" "$port_input"
+            echo -e "${GREEN}    ✓ Port $port_input mapped${NC}"
+        
         else
-            echo -e "${RED}    Invalid${NC}"; continue
+            echo -e "${RED}    Error: Invalid format${NC}"
+            continue
         fi
         
-        read -p "    Add more? [y/N]: " m
-        [[ ! "$m" =~ ^[Yy]$ ]] && break
+        read -p "    Add more mappings? [y/N]: " add_more
+        [[ ! "$add_more" =~ ^[Yy]$ ]] && break
     done
     
-    [[ $MAP_COUNT -eq 0 ]] && {
+    # Add default mapping if none defined
+    if [[ $MAP_COUNT -eq 0 ]]; then
         MAPPINGS="  - type: tcp\n    bind: \"0.0.0.0:8080\"\n    target: \"127.0.0.1:8080\"\n"
         MAP_COUNT=1
-        echo -e "${YELLOW}  Default: 8080->8080${NC}"
-    }
+        echo -e "${YELLOW}  Default mapping added: 8080 -> 8080${NC}"
+    fi
 }
 
 # ============================================================================
-# DEFAULTS PER PROFILE (بهینه‌سازی شده برای HTTP Mux)
+# PROFILE DEFAULTS
 # ============================================================================
 
-set_defaults() {
-    local p=$1
-    case $p in
+set_profile_defaults() {
+    local profile=$1
+    
+    case $profile in
         aggressive)
-            V_SMUX_KA=3
-            V_SMUX_RECV=33554432
-            V_SMUX_STREAM=33554432
-            V_KCP_INT=5
-            V_KCP_SNDWND=4096
-            V_KCP_RCVWND=4096
-            V_MTU=1400
-            V_DNS="8.8.8.8,1.1.1.1"
+            # Aggressive profile - maximum throughput
+            SMUX_KEEPALIVE=3
+            SMUX_MAX_RECV=33554432
+            SMUX_MAX_STREAM=33554432
+            SMUX_FRAME_SIZE=65536
+            KCP_INTERVAL=5
+            KCP_SNDWND=4096
+            KCP_RCVWND=4096
+            MTU_VALUE=1400
+            DNS_SERVERS="8.8.8.8,1.1.1.1"
+            TCP_KEEPALIVE=20
             ;;
         latency)
-            V_SMUX_KA=5
-            V_SMUX_RECV=16777216
-            V_SMUX_STREAM=16777216
-            V_KCP_INT=8
-            V_KCP_SNDWND=2048
-            V_KCP_RCVWND=2048
-            V_MTU=1350
-            V_DNS="8.8.8.8,1.1.1.1"
+            # Latency profile - optimized for gaming/voip
+            SMUX_KEEPALIVE=5
+            SMUX_MAX_RECV=16777216
+            SMUX_MAX_STREAM=16777216
+            SMUX_FRAME_SIZE=32768
+            KCP_INTERVAL=10
+            KCP_SNDWND=2048
+            KCP_RCVWND=2048
+            MTU_VALUE=1350
+            DNS_SERVERS="8.8.8.8,1.1.1.1"
+            TCP_KEEPALIVE=30
             ;;
         *)
-            V_SMUX_KA=4
-            V_SMUX_RECV=25165824
-            V_SMUX_STREAM=25165824
-            V_KCP_INT=6
-            V_KCP_SNDWND=3072
-            V_KCP_RCVWND=3072
-            V_MTU=1450
-            V_DNS="8.8.8.8,1.1.1.1"
+            # Balanced profile - default
+            SMUX_KEEPALIVE=4
+            SMUX_MAX_RECV=25165824
+            SMUX_MAX_STREAM=25165824
+            SMUX_FRAME_SIZE=49152
+            KCP_INTERVAL=8
+            KCP_SNDWND=3072
+            KCP_RCVWND=3072
+            MTU_VALUE=1450
+            DNS_SERVERS="8.8.8.8,1.1.1.1"
+            TCP_KEEPALIVE=25
             ;;
     esac
     
-    V_SMUX_FRAME=49152
-    V_SMUX_VER=2
-    V_KCP_NODELAY=1
-    V_KCP_RESEND=2
-    V_KCP_NC=1
+    # Common settings
+    SMUX_VERSION=2
+    KCP_NODELAY=1
+    KCP_RESEND=2
+    KCP_NC=1
     
-    V_ADV_TCP_ND=true
-    V_ADV_TCP_KA=30
-    V_ADV_TCP_RBUF=8388608
-    V_ADV_TCP_WBUF=8388608
-    V_ADV_WS_RBUF=131072
-    V_ADV_WS_WBUF=131072
-    V_ADV_WS_COMP=false
-    V_ADV_CLEANUP=5
-    V_ADV_SESS_TO=120
-    V_ADV_CONN_TO=45
-    V_ADV_STREAM_TO=300
-    V_ADV_MAX_CONN=5000
-    V_ADV_MAX_UDP=2000
-    V_ADV_UDP_TO=600
-    V_ADV_UDP_BUF=8388608
+    # Advanced TCP settings
+    TCP_NODELAY=true
+    TCP_READ_BUFFER=16777216
+    TCP_WRITE_BUFFER=16777216
+    MAX_CONNECTIONS=10000
+    CONNECTION_TIMEOUT=60
+    STREAM_TIMEOUT=300
     
-    V_OBF_ON=true
-    V_OBF_MINP=32
-    V_OBF_MAXP=1024
-    V_OBF_MIND=0
-    V_OBF_MAXD=0
-    V_OBF_BURST=0.1
+    # Obfuscation
+    OBFUSCATION=true
+    OBFUSCATION_MIN_PAD=32
+    OBFUSCATION_MAX_PAD=1024
     
-    V_HTTP_DOM="www.google.com"
-    V_HTTP_PATH="/search"
-    V_HTTP_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    # HTTP mimic
+    FAKE_DOMAIN="www.google.com"
+    FAKE_PATH="/search"
+    USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     
-    V_MAX_SESS=0
-    V_HEARTBEAT=15
-    V_VERBOSE=false
-    
-    V_LB_STRAT="round_robin"
-    V_LB_HEALTH=15
-    V_LB_FAIL_DLY=1000
-    V_LB_MAXFAIL=5
-    V_LB_RECOV=60
-    V_LB_STICKY=false
+    # Load balancer (for client)
+    LB_STRATEGY="round_robin"
+    LB_HEALTH_CHECK=15
+    LB_FAILOVER_DELAY=1000
+    LB_MAX_FAILURES=5
+    LB_RECOVERY_TIME=60
 }
 
 # ============================================================================
-# ADVANCED EDITOR (با گزینه‌های MTU و DNS)
+# ADVANCED SETTINGS EDITOR
 # ============================================================================
 
-edit_advanced() {
+edit_advanced_settings() {
     echo ""
     echo -e "${CYAN}━━━ Advanced Settings ━━━${NC}"
     
-    echo -e "${YELLOW}Network Optimization:${NC}"
-    read -p "  MTU [$V_MTU]: " v
-    V_MTU=${v:-$V_MTU}
+    echo -e "${YELLOW}Network:${NC}"
+    read -p "  MTU [$MTU_VALUE]: " new_mtu
+    MTU_VALUE=${new_mtu:-$MTU_VALUE}
     
-    read -p "  DNS Servers (comma separated) [$V_DNS]: " v
-    V_DNS=${v:-$V_DNS}
+    read -p "  DNS Servers (comma separated) [$DNS_SERVERS]: " new_dns
+    DNS_SERVERS=${new_dns:-$DNS_SERVERS}
     
-    echo -e "${YELLOW}SMUX (TCP Mux) Settings:${NC}"
-    read -p "  keepalive [$V_SMUX_KA]: " v
-    V_SMUX_KA=${v:-$V_SMUX_KA}
+    echo -e "${YELLOW}SMUX (TCP Mux):${NC}"
+    read -p "  Keepalive interval (seconds) [$SMUX_KEEPALIVE]: " new_ka
+    SMUX_KEEPALIVE=${new_ka:-$SMUX_KEEPALIVE}
     
-    read -p "  max_recv [$V_SMUX_RECV]: " v
-    V_SMUX_RECV=${v:-$V_SMUX_RECV}
+    read -p "  Frame size [$SMUX_FRAME_SIZE]: " new_frame
+    SMUX_FRAME_SIZE=${new_frame:-$SMUX_FRAME_SIZE}
     
-    read -p "  max_stream [$V_SMUX_RECV]: " v
-    V_SMUX_STREAM=${v:-$V_SMUX_STREAM}
+    echo -e "${YELLOW}KCP:${NC}"
+    read -p "  Send window [$KCP_SNDWND]: " new_snd
+    KCP_SNDWND=${new_snd:-$KCP_SNDWND}
     
-    read -p "  frame_size [$V_SMUX_FRAME]: " v
-    V_SMUX_FRAME=${v:-$V_SMUX_FRAME}
-    
-    echo -e "${YELLOW}KCP Settings:${NC}"
-    read -p "  nodelay [$V_KCP_NODELAY]: " v
-    V_KCP_NODELAY=${v:-$V_KCP_NODELAY}
-    
-    read -p "  interval [$V_KCP_INT]: " v
-    V_KCP_INT=${v:-$V_KCP_INT}
-    
-    read -p "  sndwnd [$V_KCP_SNDWND]: " v
-    V_KCP_SNDWND=${v:-$V_KCP_SNDWND}
-    
-    read -p "  rcvwnd [$V_KCP_RCVWND]: " v
-    V_KCP_RCVWND=${v:-$V_KCP_RCVWND}
-    
-    echo -e "${YELLOW}TCP Settings:${NC}"
-    read -p "  tcp_nodelay [$V_ADV_TCP_ND]: " v
-    V_ADV_TCP_ND=${v:-$V_ADV_TCP_ND}
-    
-    read -p "  tcp_keepalive [$V_ADV_TCP_KA]: " v
-    V_ADV_TCP_KA=${v:-$V_ADV_TCP_KA}
+    read -p "  Receive window [$KCP_RCVWND]: " new_rcv
+    KCP_RCVWND=${new_rcv:-$KCP_RCVWND}
     
     echo -e "${YELLOW}Obfuscation:${NC}"
-    read -p "  enabled [$V_OBF_ON]: " v
-    V_OBF_ON=${v:-$V_OBF_ON}
+    read -p "  Enable obfuscation? (true/false) [$OBFUSCATION]: " new_obf
+    OBFUSCATION=${new_obf:-$OBFUSCATION}
     
-    echo -e "${YELLOW}HTTP Mimicry:${NC}"
-    read -p "  fake_domain [$V_HTTP_DOM]: " v
-    V_HTTP_DOM=${v:-$V_HTTP_DOM}
+    echo -e "${YELLOW}HTTP Mimic:${NC}"
+    read -p "  Fake domain [$FAKE_DOMAIN]: " new_domain
+    FAKE_DOMAIN=${new_domain:-$FAKE_DOMAIN}
 }
 
 # ============================================================================
-# TRANSPORT SELECTOR (فقط HTTP Mux)
+# TRANSPORT SELECTOR (HTTP Mux only)
 # ============================================================================
 
 select_transport() {
-    # فقط httpmux باقی مانده
-    V_TRANSPORT="httpmux"
-    echo -e "  Transport: ${GREEN}httpmux${NC} (only)"
+    TRANSPORT="httpmux"
+    echo -e "  Transport: ${GREEN}httpmux${NC} (only available option)"
 }
 
 # ============================================================================
@@ -411,80 +437,82 @@ select_transport() {
 
 select_profile() {
     echo ""
-    echo -e "${YELLOW}Profile:${NC}"
-    echo "  1) balanced [default]"
-    echo "  2) aggressive (more bandwidth)"
-    echo "  3) latency (gaming/voip)"
-    read -p "  Choice [1]: " pc
-    case $pc in 2) V_PROFILE="aggressive" ;; 3) V_PROFILE="latency" ;; *) V_PROFILE="balanced" ;; esac
+    echo -e "${YELLOW}Select Profile:${NC}"
+    echo "  1) Balanced (default) - Good for general use"
+    echo "  2) Aggressive - Maximum throughput"
+    echo "  3) Latency - Optimized for gaming/voip"
+    
+    read -p "  Choice [1]: " profile_choice
+    
+    case $profile_choice in
+        2) PROFILE="aggressive" ;;
+        3) PROFILE="latency" ;;
+        *) PROFILE="balanced" ;;
+    esac
+    
+    set_profile_defaults "$PROFILE"
+    echo -e "${GREEN}  ✓ Profile: $PROFILE${NC}"
 }
 
 # ============================================================================
-# SHARED CONFIG
+# WRITE SHARED CONFIGURATION
 # ============================================================================
 
 write_shared_config() {
-    local f=$1
+    local config_file=$1
     
-    # تنظیم DNS در سیستم
-    if [[ -n "$V_DNS" ]]; then
-        echo "nameserver ${V_DNS//,/\nnameserver }" > /etc/resolv.conf 2>/dev/null
+    # Update DNS if specified
+    if [[ -n "$DNS_SERVERS" ]]; then
+        > /etc/resolv.conf
+        IFS=',' read -ra DNS_LIST <<< "$DNS_SERVERS"
+        for dns in "${DNS_LIST[@]}"; do
+            echo "nameserver $dns" >> /etc/resolv.conf
+        done
     fi
     
-    cat >> "$f" << YAML
+    cat >> "$config_file" << YAML
 
 smux:
-  keepalive: ${V_SMUX_KA}
-  max_recv: ${V_SMUX_RECV}
-  max_stream: ${V_SMUX_STREAM}
-  frame_size: ${V_SMUX_FRAME}
-  version: ${V_SMUX_VER}
+  keepalive: ${SMUX_KEEPALIVE}
+  max_recv: ${SMUX_MAX_RECV}
+  max_stream: ${SMUX_MAX_STREAM}
+  frame_size: ${SMUX_FRAME_SIZE}
+  version: ${SMUX_VERSION}
 
 kcp:
-  nodelay: ${V_KCP_NODELAY}
-  interval: ${V_KCP_INT}
-  resend: ${V_KCP_RESEND}
-  nc: ${V_KCP_NC}
-  sndwnd: ${V_KCP_SNDWND}
-  rcvwnd: ${V_KCP_RCVWND}
-  mtu: ${V_MTU}
+  nodelay: ${KCP_NODELAY}
+  interval: ${KCP_INTERVAL}
+  resend: ${KCP_RESEND}
+  nc: ${KCP_NC}
+  sndwnd: ${KCP_SNDWND}
+  rcvwnd: ${KCP_RCVWND}
+  mtu: ${MTU_VALUE}
 
 advanced:
-  tcp_nodelay: ${V_ADV_TCP_ND}
-  tcp_keepalive: ${V_ADV_TCP_KA}
-  tcp_read_buffer: ${V_ADV_TCP_RBUF}
-  tcp_write_buffer: ${V_ADV_TCP_WBUF}
-  websocket_read_buffer: ${V_ADV_WS_RBUF}
-  websocket_write_buffer: ${V_ADV_WS_WBUF}
-  websocket_compression: ${V_ADV_WS_COMP}
-  cleanup_interval: ${V_ADV_CLEANUP}
-  session_timeout: ${V_ADV_SESS_TO}
-  connection_timeout: ${V_ADV_CONN_TO}
-  stream_timeout: ${V_ADV_STREAM_TO}
-  max_connections: ${V_ADV_MAX_CONN}
-  max_udp_flows: ${V_ADV_MAX_UDP}
-  udp_flow_timeout: ${V_ADV_UDP_TO}
-  udp_buffer_size: ${V_ADV_UDP_BUF}
+  tcp_nodelay: ${TCP_NODELAY}
+  tcp_keepalive: ${TCP_KEEPALIVE}
+  tcp_read_buffer: ${TCP_READ_BUFFER}
+  tcp_write_buffer: ${TCP_WRITE_BUFFER}
+  max_connections: ${MAX_CONNECTIONS}
+  connection_timeout: ${CONNECTION_TIMEOUT}
+  stream_timeout: ${STREAM_TIMEOUT}
 
 obfuscation:
-  enabled: ${V_OBF_ON}
-  min_padding: ${V_OBF_MINP}
-  max_padding: ${V_OBF_MAXP}
-  min_delay_ms: ${V_OBF_MIND}
-  max_delay_ms: ${V_OBF_MAXD}
-  burst_chance: ${V_OBF_BURST}
+  enabled: ${OBFUSCATION}
+  min_padding: ${OBFUSCATION_MIN_PAD}
+  max_padding: ${OBFUSCATION_MAX_PAD}
 
 http_mimic:
-  fake_domain: "${V_HTTP_DOM}"
-  fake_path: "${V_HTTP_PATH}"
-  user_agent: "${V_HTTP_UA}"
+  fake_domain: "${FAKE_DOMAIN}"
+  fake_path: "${FAKE_PATH}"
+  user_agent: "${USER_AGENT}"
   chunked_encoding: false
   session_cookie: true
 YAML
 }
 
 # ============================================================================
-# MULTI-LISTENER COLLECTOR
+# COLLECT LISTENERS (Server)
 # ============================================================================
 
 collect_listeners() {
@@ -498,328 +526,482 @@ collect_listeners() {
 
         select_transport
         
-        # پورت پیشفرض 2020
+        # Default port 2020
         local default_port=2020
         [[ $LISTENER_COUNT -gt 0 ]] && default_port=$((2020 + LISTENER_COUNT))
-        read -p "  Listen port [${default_port}]: " l_port
-        l_port=${l_port:-$default_port}
+        
+        read -p "  Listen port [${default_port}]: " listen_port
+        listen_port=${listen_port:-$default_port}
 
-        local l_cert="" l_key=""
-        # برای httpmux احتیاج به سرتیفیکیت نیست، اما اگر کاربر بخواهد می‌تواند اضافه کند
+        local cert_file=""
+        local key_file=""
+        
         read -p "  Use SSL? (y/N): " use_ssl
         if [[ "$use_ssl" =~ ^[Yy]$ ]]; then
+            read -p "  Certificate domain [$FAKE_DOMAIN]: " cert_domain
+            cert_domain=${cert_domain:-$FAKE_DOMAIN}
+            
             if [[ "$CERT_GENERATED" != "true" ]]; then
-                read -p "  Cert domain [$V_HTTP_DOM]: " cd; cd=${cd:-$V_HTTP_DOM}
-                gen_cert "$cd"
+                generate_certificate "$cert_domain"
                 CERT_GENERATED=true
             fi
-            l_cert="$CONFIG_DIR/certs/cert.pem"
-            l_key="$CONFIG_DIR/certs/key.pem"
-            V_TRANSPORT="httpsmux"  # تغییر به httpsmux اگر SSL فعال باشد
+            
+            cert_file="$CONFIG_DIR/certs/cert.pem"
+            key_file="$CONFIG_DIR/certs/key.pem"
+            TRANSPORT="httpsmux"
         fi
 
         echo ""
-        echo -e "${YELLOW}  Port mappings for listener :${l_port} [${V_TRANSPORT}]:${NC}"
+        echo -e "${YELLOW}  Configure port mappings for :${listen_port} [${TRANSPORT}]:${NC}"
         collect_port_mappings
 
-        LISTENERS_BLOCK+="  - addr: \"0.0.0.0:${l_port}\"\n"
-        LISTENERS_BLOCK+="    transport: \"${V_TRANSPORT}\"\n"
-        [[ -n "$l_cert" ]] && LISTENERS_BLOCK+="    cert_file: \"${l_cert}\"\n    key_file: \"${l_key}\"\n"
+        LISTENERS_BLOCK+="  - addr: \"0.0.0.0:${listen_port}\"\n"
+        LISTENERS_BLOCK+="    transport: \"${TRANSPORT}\"\n"
+        
+        if [[ -n "$cert_file" ]]; then
+            LISTENERS_BLOCK+="    cert_file: \"${cert_file}\"\n"
+            LISTENERS_BLOCK+="    key_file: \"${key_file}\"\n"
+        fi
+        
         LISTENERS_BLOCK+="    maps:\n"
+        
         while IFS= read -r line; do
             [[ -n "$line" ]] && LISTENERS_BLOCK+="    ${line}\n"
         done <<< "$(echo -e "$MAPPINGS")"
 
         LISTENER_COUNT=$((LISTENER_COUNT+1))
-        echo -e "${GREEN}  ✓ Listener #${LISTENER_COUNT}: :${l_port} [${V_TRANSPORT}] ${MAP_COUNT} maps${NC}"
+        echo -e "${GREEN}  ✓ Listener #${LISTENER_COUNT}: Port ${listen_port} [${TRANSPORT}] with ${MAP_COUNT} mappings${NC}"
 
-        read -p "  Add another listener? [y/N]: " more
-        [[ ! "$more" =~ ^[Yy]$ ]] && break
+        read -p "  Add another listener? [y/N]: " add_listener
+        [[ ! "$add_listener" =~ ^[Yy]$ ]] && break
     done
 }
 
 # ============================================================================
-# YAML WRITERS
+# WRITE SERVER CONFIGURATION
 # ============================================================================
 
-write_server_yaml() {
-    local f="$CONFIG_DIR/server.yaml"
+write_server_config() {
+    local config_file="$CONFIG_DIR/server.yaml"
     
-    # خواندن PSK از فایل
+    # Read PSK from file
     if [[ -f "$CONFIG_DIR/psk.key" ]]; then
-        V_PSK=$(cat "$CONFIG_DIR/psk.key")
+        PSK_VALUE=$(cat "$CONFIG_DIR/psk.key")
     fi
     
-    cat > "$f" << YAML
+    cat > "$config_file" << YAML
 mode: server
-psk: "${V_PSK}"
-profile: "${V_PROFILE}"
-verbose: true
-max_sessions: ${V_MAX_SESS}
-heartbeat: ${V_HEARTBEAT}
+psk: "${PSK_VALUE}"
+profile: "${PROFILE}"
+verbose: false
+max_sessions: 0
+heartbeat: 15
 
 listeners:
 YAML
-    echo -e "$LISTENERS_BLOCK" >> "$f"
-    write_shared_config "$f"
-    echo -e "${GREEN}Config: $f${NC}"
-}
 
-write_client_yaml() {
-    local f="$CONFIG_DIR/client.yaml"
+    echo -e "$LISTENERS_BLOCK" >> "$config_file"
+    write_shared_config "$config_file"
     
-    # خواندن PSK از فایل
-    if [[ -f "$CONFIG_DIR/psk.key" ]]; then
-        V_PSK=$(cat "$CONFIG_DIR/psk.key")
-    fi
-    
-    cat > "$f" << YAML
-mode: client
-psk: "${V_PSK}"
-profile: "${V_PROFILE}"
-verbose: true
-heartbeat: ${V_HEARTBEAT}
-
-${V_PATHS_BLOCK}
-
-load_balancer:
-  strategy: "${V_LB_STRAT}"
-  health_check_sec: ${V_LB_HEALTH}
-  failover_delay_ms: ${V_LB_FAIL_DLY}
-  max_failures: ${V_LB_MAXFAIL}
-  recovery_time_sec: ${V_LB_RECOV}
-  sticky_session: ${V_LB_STICKY}
-YAML
-    write_shared_config "$f"
-    echo -e "${GREEN}Config: $f${NC}"
+    echo -e "${GREEN}[✓] Server configuration saved: $config_file${NC}"
 }
 
 # ============================================================================
-# SERVER INSTALLER
+# COLLECT CLIENT PATHS (Multi-server support)
+# ============================================================================
+
+collect_client_paths() {
+    PATHS_BLOCK="paths:"
+    PATH_COUNT=0
+    
+    while true; do
+        echo ""
+        echo -e "${YELLOW}  Server #$((PATH_COUNT+1)) Configuration${NC}"
+        
+        select_transport
+        
+        read -p "  Server address (IP or domain): " server_addr
+        [[ -z "$server_addr" ]] && { echo -e "${RED}    Error: Address required${NC}"; continue; }
+        
+        # Add default port 2020 if not specified
+        if [[ ! "$server_addr" =~ :[0-9]+$ ]]; then
+            server_addr="${server_addr}:2020"
+            echo -e "    Using default port: ${GREEN}2020${NC}"
+        fi
+        
+        read -p "  Connection pool size [3]: " pool_size
+        pool_size=${pool_size:-3}
+        
+        read -p "  Retry interval (seconds) [2]: " retry_interval
+        retry_interval=${retry_interval:-2}
+        
+        read -p "  Dial timeout (seconds) [15]: " dial_timeout
+        dial_timeout=${dial_timeout:-15}
+        
+        read -p "  Weight for load balancing [1]: " server_weight
+        server_weight=${server_weight:-1}
+        
+        PATHS_BLOCK+="
+  - transport: \"${TRANSPORT}\"
+    addr: \"${server_addr}\"
+    connection_pool: ${pool_size}
+    retry_interval: ${retry_interval}
+    dial_timeout: ${dial_timeout}
+    weight: ${server_weight}
+    priority: 0"
+        
+        PATH_COUNT=$((PATH_COUNT+1))
+        echo -e "${GREEN}  ✓ Added server: ${server_addr}${NC}"
+        
+        read -p "  Add another server? [y/N]: " add_server
+        [[ ! "$add_server" =~ ^[Yy]$ ]] && break
+    done
+}
+
+# ============================================================================
+# WRITE CLIENT CONFIGURATION
+# ============================================================================
+
+write_client_config() {
+    local config_file="$CONFIG_DIR/client.yaml"
+    
+    # Read PSK from file
+    if [[ -f "$CONFIG_DIR/psk.key" ]]; then
+        PSK_VALUE=$(cat "$CONFIG_DIR/psk.key")
+    fi
+    
+    cat > "$config_file" << YAML
+mode: client
+psk: "${PSK_VALUE}"
+profile: "${PROFILE}"
+verbose: false
+heartbeat: 15
+
+${PATHS_BLOCK}
+
+load_balancer:
+  strategy: "${LB_STRATEGY}"
+  health_check_sec: ${LB_HEALTH_CHECK}
+  failover_delay_ms: ${LB_FAILOVER_DELAY}
+  max_failures: ${LB_MAX_FAILURES}
+  recovery_time_sec: ${LB_RECOVERY_TIME}
+  sticky_session: false
+YAML
+
+    write_shared_config "$config_file"
+    
+    echo -e "${GREEN}[✓] Client configuration saved: $config_file${NC}"
+}
+
+# ============================================================================
+# INSTALL SERVER
 # ============================================================================
 
 install_server() {
     banner
     mkdir -p "$CONFIG_DIR"
-    echo -e "${CYAN}━━━ Server Setup (Iran) ━━━${NC}"
     
-    # حالت بدون لایسنس
-    setup_without_license
+    echo -e "${CYAN}━━━ Server Installation (Iran) ━━━${NC}"
+    echo -e "${YELLOW}This will configure the Iran side server${NC}\n"
     
-    echo "  1) Single Listener (recommended)"
-    echo "  2) Multi-Listener (multiple ports)"
-    echo "  3) Manual (full control)"
-    read -p "  Mode [1]: " inst_mode
-
+    setup_psk
+    
+    echo ""
+    echo "  Installation Mode:"
+    echo "    1) Single Listener (recommended)"
+    echo "    2) Multi-Listener (multiple ports)"
+    echo "    3) Manual Configuration"
+    
+    read -p "  Choice [1]: " install_mode
+    
     select_profile
-    set_defaults "$V_PROFILE"
-
-    case $inst_mode in
+    
+    case $install_mode in
         2|3)
-            echo ""
-            echo -e "${CYAN}  هر Listener می‌تواند پورت مخصوص خود را داشته باشد${NC}"
             collect_listeners
             ;;
         *)
             select_transport
-            # پورت پیشفرض 2020
-            read -p "  Tunnel Port [2020]: " lp
-            lp=${lp:-2020}
+            
+            read -p "  Tunnel port [2020]: " tunnel_port
+            tunnel_port=${tunnel_port:-2020}
             
             CERT_GENERATED=false
-            local l_cert="" l_key=""
+            local cert_file=""
+            local key_file=""
+            
             read -p "  Use SSL? (y/N): " use_ssl
             if [[ "$use_ssl" =~ ^[Yy]$ ]]; then
-                read -p "  Cert domain [$V_HTTP_DOM]: " cd; cd=${cd:-$V_HTTP_DOM}
-                gen_cert "$cd"
+                read -p "  Certificate domain [$FAKE_DOMAIN]: " cert_domain
+                cert_domain=${cert_domain:-$FAKE_DOMAIN}
+                generate_certificate "$cert_domain"
                 CERT_GENERATED=true
-                l_cert="$CONFIG_DIR/certs/cert.pem"
-                l_key="$CONFIG_DIR/certs/key.pem"
-                V_TRANSPORT="httpsmux"
+                cert_file="$CONFIG_DIR/certs/cert.pem"
+                key_file="$CONFIG_DIR/certs/key.pem"
+                TRANSPORT="httpsmux"
             fi
             
             echo ""
             echo -e "${CYAN}━━━ Port Mappings ━━━${NC}"
             collect_port_mappings
             
-            LISTENERS_BLOCK="  - addr: \"0.0.0.0:${lp}\"\n    transport: \"${V_TRANSPORT}\"\n"
-            [[ -n "$l_cert" ]] && LISTENERS_BLOCK+="    cert_file: \"${l_cert}\"\n    key_file: \"${l_key}\"\n"
+            LISTENERS_BLOCK="  - addr: \"0.0.0.0:${tunnel_port}\"\n    transport: \"${TRANSPORT}\"\n"
+            
+            if [[ -n "$cert_file" ]]; then
+                LISTENERS_BLOCK+="    cert_file: \"${cert_file}\"\n    key_file: \"${key_file}\"\n"
+            fi
+            
             LISTENERS_BLOCK+="    maps:\n"
+            
             while IFS= read -r line; do
                 [[ -n "$line" ]] && LISTENERS_BLOCK+="    ${line}\n"
             done <<< "$(echo -e "$MAPPINGS")"
+            
             LISTENER_COUNT=1
             ;;
     esac
 
-    # Manual mode: advanced editing
-    if [[ "$inst_mode" == "3" ]]; then
-        read -p "  Edit advanced settings? [y/N]: " ea
-        [[ $ea =~ ^[Yy]$ ]] && edit_advanced
+    if [[ "$install_mode" == "3" ]]; then
+        read -p "  Edit advanced settings? [y/N]: " edit_adv
+        [[ $edit_adv =~ ^[Yy]$ ]] && edit_advanced_settings
     fi
 
-    write_server_yaml
-    create_service "server"
+    write_server_config
+    create_systemd_service "server"
 
     echo ""
-    read -p "  Optimize system? [Y/n]: " opt
-    [[ ! $opt =~ ^[Nn]$ ]] && optimize_system
+    read -p "  Optimize system? [Y/n]: " optimize_choice
+    [[ ! $optimize_choice =~ ^[Nn]$ ]] && optimize_system
 
     systemctl enable DaggerConnect-server 2>/dev/null
     systemctl start DaggerConnect-server
 
     echo ""
-    echo -e "${GREEN}━━━ Server Ready ━━━${NC}"
+    echo -e "${GREEN}━━━ Server Installation Complete ━━━${NC}"
     echo -e "  Listeners: ${GREEN}${LISTENER_COUNT}${NC}"
-    echo -e "  Profile: ${GREEN}${V_PROFILE}${NC}"
-    echo -e "  PSK: ${GREEN}${V_PSK}${NC}"
-    echo -e "  Config: $CONFIG_DIR/server.yaml"
-    echo -e "  Logs: journalctl -u DaggerConnect-server -f"
+    echo -e "  Profile: ${GREEN}${PROFILE}${NC}"
+    echo -e "  PSK: ${GREEN}${PSK_VALUE}${NC}"
+    echo -e "  Config: ${CYAN}$CONFIG_DIR/server.yaml${NC}"
+    echo -e "  Logs: ${CYAN}journalctl -u DaggerConnect-server -f${NC}"
     echo ""
-    read -p "Press Enter..."
+    
+    read -p "Press Enter to continue..."
     main_menu
 }
 
 # ============================================================================
-# CLIENT INSTALLER (اتصال به چند سرور خارج)
+# INSTALL CLIENT
 # ============================================================================
-
-collect_client_paths() {
-    V_PATHS_BLOCK="paths:"
-    PATH_COUNT=0
-    
-    while true; do
-        echo ""
-        echo -e "${YELLOW}  Server #$((PATH_COUNT+1)) (Kharej)${NC}"
-        
-        select_transport
-        
-        read -p "  Server address (ip:port) [پورت پیشفرض 2020]: " addr
-        [[ -z "$addr" ]] && { echo -e "${RED}  Required${NC}"; continue; }
-        
-        # اضافه کردن پورت 2020 اگر مشخص نشده باشد
-        if [[ ! "$addr" =~ :[0-9]+$ ]]; then
-            addr="${addr}:2020"
-            echo -e "  Using default port: ${GREEN}2020${NC}"
-        fi
-        
-        read -p "  Connection pool [3]: " pool
-        pool=${pool:-3}
-        
-        read -p "  Retry interval sec [2]: " retry
-        retry=${retry:-2}
-        
-        read -p "  Dial timeout sec [15]: " dtout
-        dtout=${dtout:-15}
-        
-        read -p "  Weight (for LB) [1]: " weight
-        weight=${weight:-1}
-        
-        V_PATHS_BLOCK+="
-  - transport: \"${V_TRANSPORT}\"
-    addr: \"${addr}\"
-    connection_pool: ${pool}
-    retry_interval: ${retry}
-    dial_timeout: ${dtout}
-    weight: ${weight}
-    priority: 0"
-        
-        PATH_COUNT=$((PATH_COUNT+1))
-        echo -e "${GREEN}  Added: ${addr} [${V_TRANSPORT}]${NC}"
-        
-        read -p "  Add another server? [y/N]: " m
-        [[ ! "$m" =~ ^[Yy]$ ]] && break
-    done
-}
 
 install_client() {
     banner
     mkdir -p "$CONFIG_DIR"
-    echo -e "${CYAN}━━━ Client Setup (Kharej) ━━━${NC}"
-    echo -e "${YELLOW}این سمت می‌تواند به چند سرور ایران متصل شود${NC}"
     
-    # حالت بدون لایسنس
-    setup_without_license
+    echo -e "${CYAN}━━━ Client Installation (Kharej) ━━━${NC}"
+    echo -e "${YELLOW}This will configure the Kharej side client${NC}"
+    echo -e "${YELLOW}Can connect to multiple Iran servers${NC}\n"
+    
+    setup_psk
 
     select_profile
-    set_defaults "$V_PROFILE"
     collect_client_paths
 
     if [[ $PATH_COUNT -gt 1 ]]; then
         echo ""
         echo -e "${YELLOW}  Load Balancer Strategy:${NC}"
-        echo "    1) round_robin [default]"
-        echo "    2) least_loaded"
-        echo "    3) failover"
-        echo "    4) weighted_random"
-        read -p "    Choice [1]: " lbc
-        case $lbc in 2) V_LB_STRAT="least_loaded" ;; 3) V_LB_STRAT="failover" ;; 4) V_LB_STRAT="weighted_random" ;; *) V_LB_STRAT="round_robin" ;; esac
+        echo "    1) Round Robin (default)"
+        echo "    2) Least Loaded"
+        echo "    3) Failover"
+        echo "    4) Weighted Random"
+        
+        read -p "    Choice [1]: " lb_choice
+        
+        case $lb_choice in
+            2) LB_STRATEGY="least_loaded" ;;
+            3) LB_STRATEGY="failover" ;;
+            4) LB_STRATEGY="weighted_random" ;;
+            *) LB_STRATEGY="round_robin" ;;
+        esac
     fi
 
-    read -p "  Edit advanced settings? [y/N]: " ea
-    [[ $ea =~ ^[Yy]$ ]] && edit_advanced
+    read -p "  Edit advanced settings? [y/N]: " edit_adv
+    [[ $edit_adv =~ ^[Yy]$ ]] && edit_advanced_settings
 
-    write_client_yaml
-    create_service "client"
+    write_client_config
+    create_systemd_service "client"
 
     echo ""
-    read -p "  Optimize system? [Y/n]: " opt
-    [[ ! $opt =~ ^[Nn]$ ]] && optimize_system
+    read -p "  Optimize system? [Y/n]: " optimize_choice
+    [[ ! $optimize_choice =~ ^[Nn]$ ]] && optimize_system
 
     systemctl enable DaggerConnect-client 2>/dev/null
     systemctl start DaggerConnect-client
 
     echo ""
-    echo -e "${GREEN}━━━ Client Ready ━━━${NC}"
+    echo -e "${GREEN}━━━ Client Installation Complete ━━━${NC}"
     echo -e "  Servers: ${GREEN}${PATH_COUNT}${NC}"
-    echo -e "  LB: ${GREEN}${V_LB_STRAT}${NC}"
-    echo -e "  Profile: ${GREEN}${V_PROFILE}${NC}"
-    echo -e "  PSK: ${GREEN}${V_PSK}${NC}"
-    echo -e "  Config: $CONFIG_DIR/client.yaml"
-    echo -e "  Logs: journalctl -u DaggerConnect-client -f"
+    echo -e "  Load Balancer: ${GREEN}${LB_STRATEGY}${NC}"
+    echo -e "  Profile: ${GREEN}${PROFILE}${NC}"
+    echo -e "  PSK: ${GREEN}${PSK_VALUE}${NC}"
+    echo -e "  Config: ${CYAN}$CONFIG_DIR/client.yaml${NC}"
+    echo -e "  Logs: ${CYAN}journalctl -u DaggerConnect-client -f${NC}"
     echo ""
-    read -p "Press Enter..."
+    
+    read -p "Press Enter to continue..."
     main_menu
 }
 
 # ============================================================================
-# UPDATE / UNINSTALL
+# UPDATE BINARY
 # ============================================================================
 
-update_binary() {
+update_core() {
     banner
     echo -e "${CYAN}━━━ Update Core ━━━${NC}"
-    local cur=$(get_current_version)
-    [[ "$cur" == "not-installed" ]] && { echo -e "${RED}Not installed${NC}"; read -p "Enter..."; main_menu; return; }
-    echo -e "  Current: ${YELLOW}$cur${NC}"
-    read -p "  Continue? [y/N]: " c; [[ ! $c =~ ^[Yy]$ ]] && { main_menu; return; }
+    
+    local current_version=$(get_current_version)
+    
+    if [[ "$current_version" == "not-installed" ]]; then
+        echo -e "${RED}Error: DaggerConnect not installed${NC}"
+        read -p "Press Enter..."
+        main_menu
+        return
+    fi
+    
+    echo -e "  Current version: ${YELLOW}$current_version${NC}"
+    read -p "  Continue with update? [y/N]: " confirm_update
+    
+    if [[ ! $confirm_update =~ ^[Yy]$ ]]; then
+        main_menu
+        return
+    fi
+    
     systemctl stop DaggerConnect-server 2>/dev/null
     systemctl stop DaggerConnect-client 2>/dev/null
+    
     download_binary
-    local new=$(get_current_version)
-    echo -e "  Updated: ${GREEN}$new${NC}"
+    
+    local new_version=$(get_current_version)
+    echo -e "  Updated to: ${GREEN}$new_version${NC}"
+    
     systemctl start DaggerConnect-server 2>/dev/null
     systemctl start DaggerConnect-client 2>/dev/null
+    
     echo ""
     read -p "Press Enter..."
     main_menu
 }
+
+# ============================================================================
+# CHANGE MTU
+# ============================================================================
+
+change_mtu() {
+    echo ""
+    echo -e "${CYAN}━━━ Change MTU ━━━${NC}"
+    echo -e "Current MTU values in configs:"
+    
+    if [[ -f "$CONFIG_DIR/server.yaml" ]]; then
+        current_mtu=$(grep -oP 'mtu: \K\d+' "$CONFIG_DIR/server.yaml" 2>/dev/null)
+        echo -e "  Server config: ${GREEN}$current_mtu${NC}"
+    fi
+    
+    if [[ -f "$CONFIG_DIR/client.yaml" ]]; then
+        current_mtu=$(grep -oP 'mtu: \K\d+' "$CONFIG_DIR/client.yaml" 2>/dev/null)
+        echo -e "  Client config: ${GREEN}$current_mtu${NC}"
+    fi
+    
+    echo ""
+    read -p "  Enter new MTU value [1450]: " new_mtu
+    new_mtu=${new_mtu:-1450}
+    
+    if [[ "$new_mtu" =~ ^[0-9]+$ ]] && [ "$new_mtu" -ge 576 ] && [ "$new_mtu" -le 1500 ]; then
+        sed -i "s/mtu: [0-9]*/mtu: $new_mtu/" $CONFIG_DIR/*.yaml 2>/dev/null
+        systemctl restart DaggerConnect-server DaggerConnect-client 2>/dev/null
+        echo -e "${GREEN}[✓] MTU changed to $new_mtu${NC}"
+    else
+        echo -e "${RED}Error: Invalid MTU value (must be 576-1500)${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# CHANGE DNS
+# ============================================================================
+
+change_dns() {
+    echo ""
+    echo -e "${CYAN}━━━ Change DNS ━━━${NC}"
+    echo -e "Current DNS servers:"
+    
+    if [[ -f /etc/resolv.conf ]]; then
+        grep "^nameserver" /etc/resolv.conf | while read line; do
+            echo -e "  ${GREEN}$line${NC}"
+        done
+    fi
+    
+    echo ""
+    read -p "  Enter DNS servers (comma separated) [8.8.8.8,1.1.1.1]: " new_dns
+    new_dns=${new_dns:-"8.8.8.8,1.1.1.1"}
+    
+    # Update resolv.conf
+    > /etc/resolv.conf
+    IFS=',' read -ra DNS_LIST <<< "$new_dns"
+    for dns in "${DNS_LIST[@]}"; do
+        dns=$(echo "$dns" | tr -d ' ')
+        echo "nameserver $dns" >> /etc/resolv.conf
+    done
+    
+    echo -e "${GREEN}[✓] DNS updated${NC}"
+    echo ""
+    
+    read -p "Press Enter..."
+    main_menu
+}
+
+# ============================================================================
+# UNINSTALL
+# ============================================================================
 
 uninstall() {
     banner
     echo -e "${RED}━━━ Uninstall DaggerConnect ━━━${NC}"
-    read -p "  Are you sure? [y/N]: " c; [[ ! $c =~ ^[Yy]$ ]] && { main_menu; return; }
+    echo -e "${YELLOW}Warning: This will remove all configurations${NC}"
+    
+    read -p "  Are you sure? [y/N]: " confirm_uninstall
+    if [[ ! $confirm_uninstall =~ ^[Yy]$ ]]; then
+        main_menu
+        return
+    fi
+    
+    # Stop services
     systemctl stop DaggerConnect-server 2>/dev/null
     systemctl stop DaggerConnect-client 2>/dev/null
+    
+    # Disable services
     systemctl disable DaggerConnect-server 2>/dev/null
     systemctl disable DaggerConnect-client 2>/dev/null
-    rm -f "$SYSTEMD_DIR/DaggerConnect-server.service" "$SYSTEMD_DIR/DaggerConnect-client.service"
+    
+    # Remove service files
+    rm -f "$SYSTEMD_DIR/DaggerConnect-server.service"
+    rm -f "$SYSTEMD_DIR/DaggerConnect-client.service"
+    
+    # Remove binary
     rm -f "$INSTALL_DIR/DaggerConnect"
+    
+    # Remove configuration
     rm -rf "$CONFIG_DIR"
+    
+    # Remove sysctl config
     rm -f /etc/sysctl.d/99-daggerconnect.conf
     sysctl -p > /dev/null 2>&1
+    
     systemctl daemon-reload
-    echo -e "${GREEN}Uninstalled${NC}"
+    
+    echo -e "${GREEN}[✓] DaggerConnect uninstalled successfully${NC}"
     exit 0
 }
 
@@ -829,12 +1011,17 @@ uninstall() {
 
 main_menu() {
     banner
-    local ver=$(get_current_version)
-    [[ "$ver" != "not-installed" ]] && echo -e "  Version: ${GREEN}$ver${NC}" && echo ""
+    
+    local current_version=$(get_current_version)
+    if [[ "$current_version" != "not-installed" ]]; then
+        echo -e "  Installed version: ${GREEN}$current_version${NC}"
+        echo ""
+    fi
+    
     echo -e "${CYAN}━━━ Main Menu (HTTP Mux Only) ━━━${NC}"
     echo ""
-    echo "  1) Install Server (Iran)"
-    echo "  2) Install Client (Kharej - Multi Server)"
+    echo "  1) Install Server (Iran side)"
+    echo "  2) Install Client (Kharej side - Multi-server)"
     echo "  3) Update Core"
     echo "  4) System Optimizer"
     echo "  5) Change MTU"
@@ -843,44 +1030,41 @@ main_menu() {
     echo ""
     echo "  0) Exit"
     echo ""
-    read -p "  Choice: " c
-    case $c in
+    
+    read -p "  Choice: " menu_choice
+    
+    case $menu_choice in
         1) install_server ;;
         2) install_client ;;
-        3) update_binary ;;
+        3) update_core ;;
         4) optimize_system; read -p "Press Enter..."; main_menu ;;
-        5) 
-            read -p "  Enter new MTU [1450]: " new_mtu
-            new_mtu=${new_mtu:-1450}
-            sed -i "s/mtu: [0-9]*/mtu: $new_mtu/" $CONFIG_DIR/*.yaml 2>/dev/null
-            systemctl restart DaggerConnect-server DaggerConnect-client 2>/dev/null
-            echo -e "${GREEN}MTU changed to $new_mtu${NC}"
-            read -p "Press Enter..."
-            main_menu
-            ;;
-        6)
-            read -p "  Enter DNS servers (comma separated) [8.8.8.8,1.1.1.1]: " new_dns
-            new_dns=${new_dns:-"8.8.8.8,1.1.1.1"}
-            echo "nameserver ${new_dns//,/\nnameserver }" > /etc/resolv.conf 2>/dev/null
-            echo -e "${GREEN}DNS changed to $new_dns${NC}"
-            read -p "Press Enter..."
-            main_menu
-            ;;
+        5) change_mtu ;;
+        6) change_dns ;;
         7) uninstall ;;
-        0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
+        0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
         *) main_menu ;;
     esac
 }
 
-# شروع برنامه
-check_root
-banner
-install_deps
+# ============================================================================
+# SCRIPT START
+# ============================================================================
 
+# Check root privileges
+check_root
+
+# Show banner
+banner
+
+# Install dependencies if needed
+install_dependencies
+
+# Download binary if not present
 if [[ ! -f "$INSTALL_DIR/DaggerConnect" ]]; then
-    echo -e "${YELLOW}DaggerConnect not found. Installing...${NC}"
+    echo -e "${YELLOW}DaggerConnect binary not found. Installing...${NC}"
     download_binary
     echo ""
 fi
 
+# Start main menu
 main_menu
