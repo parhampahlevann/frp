@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================
-# Ultra Simple & Safe Traffic Balancer
-# Version: 4.0 - Minimum Risk Version
+# Stable Traffic Balancer - No Disconnection
+# Version: 5.0 - Stable Version
 # ==============================================
 
 # Colors
@@ -13,15 +13,17 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Configuration
-CONFIG_DIR="/root/simple-balancer"
-LOG_FILE="/root/simple-balancer/install.log"
+CONFIG_DIR="/root/stable-balancer"
+LOG_FILE="$CONFIG_DIR/balancer.log"
+ACTIVE_FILE="$CONFIG_DIR/active.txt"
+STATUS_FILE="$CONFIG_DIR/status.txt"
 
-# Create log directory
+# Create config directory
 mkdir -p "$CONFIG_DIR"
 
-# Simple logging
+# Logging
 log() {
-    echo "$(date): $1" >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
     echo -e "$1"
 }
 
@@ -45,7 +47,7 @@ print_warning() {
     log "[WARNING] $1"
 }
 
-# Check if running as root
+# Check root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
@@ -53,39 +55,14 @@ check_root() {
     fi
 }
 
-# Simple system check
-simple_check() {
-    print_info "Performing basic system check..."
-    
-    # Check if it's Ubuntu/Debian
-    if [ ! -f "/etc/debian_version" ]; then
-        print_error "This script only works on Ubuntu/Debian"
-        exit 1
-    fi
-    
-    # Check internet connectivity
-    if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-        print_warning "No internet connection detected"
-        read -p "Continue anyway? (y/n): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-    
-    print_success "Basic check passed"
-}
-
-# Get server IPs (simple version)
-get_server_ips() {
-    local ips=()
-    
+# Get server information
+get_servers() {
     echo
     print_info "Foreign Servers Configuration"
     echo "----------------------------------------"
     
     while true; do
-        read -p "How many foreign servers? (1-2): " count
+        read -p "Number of foreign servers (1-2): " count
         if [[ "$count" =~ ^[1-2]$ ]]; then
             break
         else
@@ -93,12 +70,18 @@ get_server_ips() {
         fi
     done
     
+    declare -a ips
+    declare -a names
+    
     for ((i=1; i<=count; i++)); do
+        echo
+        read -p "Enter name for Server $i (e.g., Germany, Finland): " name
+        names[$i]="$name"
+        
         while true; do
             read -p "Enter IP for Server $i: " ip
-            # Simple IP validation
             if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                ips+=("$ip")
+                ips[$i]="$ip"
                 break
             else
                 print_error "Invalid IP format"
@@ -106,330 +89,494 @@ get_server_ips() {
         done
     done
     
-    # Save IPs to file
-    echo "SERVER_COUNT=$count" > "$CONFIG_DIR/servers.conf"
-    for ((i=0; i<count; i++)); do
-        echo "SERVER_$((i+1))=${ips[$i]}" >> "$CONFIG_DIR/servers.conf"
+    # Save configuration
+    cat > "$CONFIG_DIR/servers.conf" << EOF
+# Server Configuration
+# Created: $(date)
+SERVER_COUNT=$count
+EOF
+    
+    for ((i=1; i<=count; i++)); do
+        echo "SERVER_${i}_NAME=\"${names[$i]}\"" >> "$CONFIG_DIR/servers.conf"
+        echo "SERVER_${i}_IP=\"${ips[$i]}\"" >> "$CONFIG_DIR/servers.conf"
     done
     
+    # Return values
     echo "$count"
-    for ip in "${ips[@]}"; do
-        echo "$ip"
+    for ((i=1; i<=count; i++)); do
+        echo "${names[$i]}"
+        echo "${ips[$i]}"
     done
 }
 
-# Install minimal packages
-install_minimal() {
-    print_info "Installing ONLY essential packages..."
-    
-    # Update package list (safe mode)
-    apt-get update -qq 2>/dev/null
-    
-    # Install ONLY iproute2 (already installed on most systems)
-    if ! command -v ip >/dev/null 2>&1; then
-        apt-get install -y -qq iproute2 2>/dev/null
-    fi
-    
-    # Install ping if not available
-    if ! command -v ping >/dev/null 2>&1; then
-        apt-get install -y -qq iputils-ping 2>/dev/null
-    fi
-    
-    print_success "Package installation completed"
-}
-
-# Create simple failover script
-create_failover() {
-    local count=$1
-    shift
-    local ips=("$@")
-    
-    cat > "$CONFIG_DIR/failover.sh" << 'EOF'
+# Create stable failover script
+create_stable_failover() {
+    cat > "$CONFIG_DIR/stable-failover.sh" << 'EOF'
 #!/bin/bash
 
-CONFIG_DIR="/root/simple-balancer"
+CONFIG_DIR="/root/stable-balancer"
+LOG_FILE="$CONFIG_DIR/balancer.log"
 ACTIVE_FILE="$CONFIG_DIR/active.txt"
-LOG_FILE="$CONFIG_DIR/failover.log"
+STATUS_FILE="$CONFIG_DIR/status.txt"
 
-# Load server configuration
+# Load configuration
 source "$CONFIG_DIR/servers.conf" 2>/dev/null || {
     echo "No configuration found"
     exit 1
 }
 
-# Function to check if server is alive
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# Function to check server health (more reliable)
 check_server() {
     local ip=$1
-    # Simple ping test (1 packet, 1 second timeout)
-    ping -c 1 -W 1 "$ip" >/dev/null 2>&1
-    return $?
+    local name=$2
+    
+    # Method 1: 3 pings with 2 second timeout (more reliable)
+    ping -c 3 -W 2 "$ip" > /dev/null 2>&1
+    local ping_result=$?
+    
+    if [ $ping_result -eq 0 ]; then
+        # Method 2: Try to connect to common ports (optional, doesn't block)
+        if command -v nc >/dev/null 2>&1; then
+            nc -zv -w 2 "$ip" 22 >/dev/null 2>&1 || nc -zv -w 2 "$ip" 443 >/dev/null 2>&1
+            return 0
+        fi
+        return 0
+    fi
+    
+    return 1
 }
 
 # Initialize
 if [ ! -f "$ACTIVE_FILE" ]; then
     echo "1" > "$ACTIVE_FILE"
+    log_message "Initialized with server 1 as active"
 fi
 
-# Main loop
+# Variables for stability
+FAIL_COUNT=0
+MAX_FAILS=3
+CHECK_INTERVAL=15  # Check every 15 seconds
+STABLE_COUNT=0
+
+log_message "Stable failover started with $SERVER_COUNT servers"
+
 while true; do
     CURRENT=$(cat "$ACTIVE_FILE" 2>/dev/null || echo "1")
     
-    # Check current server first
-    CURRENT_IP_VAR="SERVER_$CURRENT"
+    # Get current server info
+    CURRENT_NAME_VAR="SERVER_${CURRENT}_NAME"
+    CURRENT_IP_VAR="SERVER_${CURRENT}_IP"
+    CURRENT_NAME=${!CURRENT_NAME_VAR}
     CURRENT_IP=${!CURRENT_IP_VAR}
     
-    if check_server "$CURRENT_IP"; then
-        # Current server is working, do nothing
-        :
+    # Check current server
+    if check_server "$CURRENT_IP" "$CURRENT_NAME"; then
+        # Server is healthy
+        FAIL_COUNT=0
+        STABLE_COUNT=$((STABLE_COUNT + 1))
+        
+        # Update status file
+        echo "ONLINE|$CURRENT|$CURRENT_NAME|$CURRENT_IP|$(date)" > "$STATUS_FILE"
+        
+        log_message "Server $CURRENT ($CURRENT_NAME) is healthy (stable for $STABLE_COUNT checks)"
     else
-        # Current server failed, try others
-        for ((i=1; i<=SERVER_COUNT; i++)); do
-            if [ "$i" != "$CURRENT" ]; then
-                TEST_IP_VAR="SERVER_$i"
-                TEST_IP=${!TEST_IP_VAR}
-                
-                if check_server "$TEST_IP"; then
-                    # Switch to this server
-                    echo "$(date): Switching to server $i ($TEST_IP)" >> "$LOG_FILE"
-                    echo "$i" > "$ACTIVE_FILE"
+        # Server might be down, increase fail count
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        log_message "Server $CURRENT check failed ($FAIL_COUNT/$MAX_FAILS)"
+        
+        if [ $FAIL_COUNT -ge $MAX_FAILS ]; then
+            # Server is considered down, try to switch
+            log_message "Server $CURRENT is considered DOWN after $FAIL_COUNT failures"
+            
+            SWITCHED=0
+            for ((i=1; i<=SERVER_COUNT; i++)); do
+                if [ "$i" != "$CURRENT" ]; then
+                    TEST_NAME_VAR="SERVER_${i}_NAME"
+                    TEST_IP_VAR="SERVER_${i}_IP"
+                    TEST_NAME=${!TEST_NAME_VAR}
+                    TEST_IP=${!TEST_IP_VAR}
                     
-                    # Simple route change (add with higher metric, don't remove existing)
-                    MAIN_IF=$(ip route show default | awk '{print $5}' | head -1)
-                    if [ -n "$MAIN_IF" ]; then
-                        # Add new route with metric 100 (lower priority than default)
-                        ip route add default via "$TEST_IP" dev "$MAIN_IF" metric 100 2>/dev/null
+                    log_message "Testing alternative server $i ($TEST_NAME)"
+                    
+                    if check_server "$TEST_IP" "$TEST_NAME"; then
+                        # Switch to this server
+                        echo "$i" > "$ACTIVE_FILE"
+                        log_message "SWITCHED to server $i ($TEST_NAME) - $TEST_IP"
+                        
+                        # Update main route only if switching
+                        MAIN_IF=$(ip route show default | awk '{print $5}' | head -1)
+                        if [ -n "$MAIN_IF" ]; then
+                            # Remove old route with metric 100 if exists
+                            ip route del default via "$CURRENT_IP" dev "$MAIN_IF" metric 100 2>/dev/null
+                            # Add new route
+                            ip route add default via "$TEST_IP" dev "$MAIN_IF" metric 100 2>/dev/null
+                        fi
+                        
+                        SWITCHED=1
+                        FAIL_COUNT=0
+                        STABLE_COUNT=0
+                        break
                     fi
-                    break
                 fi
+            done
+            
+            if [ $SWITCHED -eq 0 ]; then
+                log_message "No alternative servers available"
+                # Keep trying current server
+                FAIL_COUNT=$((MAX_FAILS - 1))
             fi
-        done
+        fi
     fi
     
-    sleep 10
+    # Dynamic check interval - check more frequently if unstable
+    if [ $STABLE_COUNT -gt 10 ]; then
+        CURRENT_INTERVAL=30  # Check every 30 seconds when stable
+    else
+        CURRENT_INTERVAL=$CHECK_INTERVAL
+    fi
+    
+    sleep $CURRENT_INTERVAL
 done
 EOF
 
-    chmod +x "$CONFIG_DIR/failover.sh"
-    print_success "Failover script created"
+    chmod +x "$CONFIG_DIR/stable-failover.sh"
+    print_success "Stable failover script created"
 }
 
-# Create simple monitor
-create_monitor() {
+# Create improved monitor
+create_improved_monitor() {
     cat > "$CONFIG_DIR/monitor.sh" << 'EOF'
 #!/bin/bash
 
-CONFIG_DIR="/root/simple-balancer"
+CONFIG_DIR="/root/stable-balancer"
 source "$CONFIG_DIR/servers.conf" 2>/dev/null
 
 while true; do
     clear
-    echo "════════════════════════════════════"
-    echo "  Simple Balancer Monitor"
-    echo "  $(date)"
-    echo "════════════════════════════════════"
+    echo "══════════════════════════════════════════════"
+    echo "  Stable Balancer Monitor - $(date)"
+    echo "══════════════════════════════════════════════"
     
-    ACTIVE=$(cat "$CONFIG_DIR/active.txt" 2>/dev/null || echo "None")
-    echo "Active Server: $ACTIVE"
+    # Show active server
+    if [ -f "$ACTIVE_FILE" ]; then
+        ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null)
+        ACTIVE_NAME_VAR="SERVER_${ACTIVE}_NAME"
+        ACTIVE_IP_VAR="SERVER_${ACTIVE}_IP"
+        ACTIVE_NAME=${!ACTIVE_NAME_VAR}
+        ACTIVE_IP=${!ACTIVE_IP_VAR}
+        
+        echo -e "${GREEN}▶ Active Server: $ACTIVE - $ACTIVE_NAME ($ACTIVE_IP)${NC}"
+    else
+        echo -e "${YELLOW}▶ No active server${NC}"
+    fi
     echo
     
+    # Show all servers with detailed status
+    echo "Server Status:"
+    echo "----------------------------------------"
+    
     for ((i=1; i<=SERVER_COUNT; i++)); do
-        SERVER_VAR="SERVER_$i"
-        SERVER_IP=${!SERVER_VAR}
+        NAME_VAR="SERVER_${i}_NAME"
+        IP_VAR="SERVER_${i}_IP"
+        NAME=${!NAME_VAR}
+        IP=${!IP_VAR}
         
-        if ping -c 1 -W 1 "$SERVER_IP" >/dev/null 2>&1; then
-            echo "Server $i: ✅ UP ($SERVER_IP)"
+        # Detailed ping statistics
+        PING_RESULT=$(ping -c 2 -W 1 "$IP" 2>/dev/null)
+        PING_TIME=$(echo "$PING_RESULT" | tail -1 | awk -F'/' '{print $5}' | cut -d'.' -f1)
+        PACKET_LOSS=$(echo "$PING_RESULT" | grep -oP '\d+(?=% packet loss)')
+        
+        if [ -n "$PACKET_LOSS" ] && [ "$PACKET_LOSS" -lt 100 ]; then
+            if [ "$i" -eq "$ACTIVE" ]; then
+                echo -e "${GREEN}✓ Server $i: $NAME - ONLINE (Active)${NC}"
+            else
+                echo -e "${GREEN}✓ Server $i: $NAME - ONLINE${NC}"
+            fi
+            echo "     IP: $IP | Ping: ${PING_TIME}ms | Loss: ${PACKET_LOSS}%"
         else
-            echo "Server $i: ❌ DOWN ($SERVER_IP)"
+            if [ "$i" -eq "$ACTIVE" ]; then
+                echo -e "${RED}✗ Server $i: $NAME - OFFLINE (Active - WARNING!)${NC}"
+            else
+                echo -e "${RED}✗ Server $i: $NAME - OFFLINE${NC}"
+            fi
+            echo "     IP: $IP | No response"
         fi
     done
     
+    # Show last 5 log entries
+    echo
+    echo "Recent Events:"
+    echo "----------------------------------------"
+    if [ -f "$LOG_FILE" ]; then
+        tail -5 "$LOG_FILE"
+    else
+        echo "No events logged yet"
+    fi
+    
     echo
     echo "Press Ctrl+C to exit"
-    sleep 3
+    sleep 5
 done
 EOF
 
     chmod +x "$CONFIG_DIR/monitor.sh"
-    print_success "Monitor script created"
+    print_success "Improved monitor created"
 }
 
-# Create uninstall script
+# Create route management script
+create_route_manager() {
+    cat > "$CONFIG_DIR/route-manager.sh" << 'EOF'
+#!/bin/bash
+
+CONFIG_DIR="/root/stable-balancer"
+source "$CONFIG_DIR/servers.conf" 2>/dev/null
+
+case "$1" in
+    add)
+        SERVER_NUM="$2"
+        if [ -n "$SERVER_NUM" ]; then
+            IP_VAR="SERVER_${SERVER_NUM}_IP"
+            IP=${!IP_VAR}
+            MAIN_IF=$(ip route show default | awk '{print $5}' | head -1)
+            
+            if [ -n "$MAIN_IF" ]; then
+                # Remove any existing metric 100 routes
+                ip route show | grep "metric 100" | while read route; do
+                    ip route del $route 2>/dev/null
+                done
+                # Add new route
+                ip route add default via "$IP" dev "$MAIN_IF" metric 100 2>/dev/null
+                echo "Route added for server $SERVER_NUM ($IP)"
+            fi
+        fi
+        ;;
+    remove)
+        # Remove all metric 100 routes
+        ip route show | grep "metric 100" | while read route; do
+            ip route del $route 2>/dev/null
+        done
+        echo "All custom routes removed"
+        ;;
+    show)
+        ip route show | grep "metric 100" || echo "No custom routes"
+        ;;
+    *)
+        echo "Usage: $0 {add <server_num>|remove|show}"
+        ;;
+esac
+EOF
+
+    chmod +x "$CONFIG_DIR/route-manager.sh"
+    print_success "Route manager created"
+}
+
+# Create startup script
+create_startup() {
+    cat > "$CONFIG_DIR/start.sh" << 'EOF'
+#!/bin/bash
+
+CONFIG_DIR="/root/stable-balancer"
+PID_FILE="$CONFIG_DIR/balancer.pid"
+
+# Kill existing process
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE")
+    if kill -0 $OLD_PID 2>/dev/null; then
+        echo "Stopping old balancer (PID: $OLD_PID)"
+        kill $OLD_PID
+        sleep 2
+    fi
+fi
+
+# Remove old routes
+"$CONFIG_DIR/route-manager.sh" remove
+
+# Start new balancer
+nohup bash "$CONFIG_DIR/stable-failover.sh" >/dev/null 2>&1 &
+NEW_PID=$!
+echo $NEW_PID > "$PID_FILE"
+
+echo "Balancer started with PID: $NEW_PID"
+
+# Wait a bit and add initial route
+sleep 3
+if [ -f "$CONFIG_DIR/active.txt" ]; then
+    ACTIVE=$(cat "$CONFIG_DIR/active.txt")
+    "$CONFIG_DIR/route-manager.sh" add $ACTIVE
+fi
+
+echo "Startup complete"
+EOF
+
+    chmod +x "$CONFIG_DIR/start.sh"
+    print_success "Startup script created"
+}
+
+# Main installation
+stable_install() {
+    echo
+    print_info "Starting Stable Installation"
+    echo "========================================"
+    
+    check_root
+    
+    # Get server information
+    result=$(get_servers)
+    count=$(echo "$result" | head -1)
+    
+    # Create all scripts
+    create_stable_failover
+    create_improved_monitor
+    create_route_manager
+    create_startup
+    
+    # Start the balancer
+    bash "$CONFIG_DIR/start.sh"
+    
+    echo
+    print_success "════════════════════════════════════════"
+    print_success "Installation Completed Successfully!"
+    print_success "════════════════════════════════════════"
+    echo
+    echo "Configuration:"
+    source "$CONFIG_DIR/servers.conf"
+    for ((i=1; i<=SERVER_COUNT; i++)); do
+        NAME_VAR="SERVER_${i}_NAME"
+        IP_VAR="SERVER_${i}_IP"
+        echo "  Server $i: ${!NAME_VAR} (${!IP_VAR})"
+    done
+    echo
+    echo "Commands:"
+    echo "  Start balancer: $CONFIG_DIR/start.sh"
+    echo "  Monitor: $CONFIG_DIR/monitor.sh"
+    echo "  View log: tail -f $CONFIG_DIR/balancer.log"
+    echo "  Route manager: $CONFIG_DIR/route-manager.sh"
+    echo "  Uninstall: $CONFIG_DIR/uninstall.sh"
+    echo
+    print_info "Balancer is running with PID: $(cat $CONFIG_DIR/balancer.pid 2>/dev/null)"
+}
+
+# Create uninstall
 create_uninstall() {
     cat > "$CONFIG_DIR/uninstall.sh" << 'EOF'
 #!/bin/bash
 
-echo "Uninstalling Simple Balancer..."
+CONFIG_DIR="/root/stable-balancer"
 
-# Kill any running processes
-pkill -f "failover.sh" 2>/dev/null
-pkill -f "monitor.sh" 2>/dev/null
+echo "Uninstalling Stable Balancer..."
 
-# Remove any added routes (only those with metric 100)
-ip route show | grep "metric 100" | while read route; do
-    ip route del $route 2>/dev/null
-done
+# Stop balancer
+if [ -f "$CONFIG_DIR/balancer.pid" ]; then
+    PID=$(cat "$CONFIG_DIR/balancer.pid")
+    kill $PID 2>/dev/null
+    kill -9 $PID 2>/dev/null
+fi
 
-# Remove configuration directory
-rm -rf /root/simple-balancer
+# Kill any remaining processes
+pkill -f "stable-failover.sh" 2>/dev/null
+
+# Remove routes
+"$CONFIG_DIR/route-manager.sh" remove 2>/dev/null
+
+# Ask about removing configuration
+read -p "Remove all configuration files? (y/n): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    rm -rf "$CONFIG_DIR"
+    echo "Configuration removed"
+else
+    echo "Configuration kept in $CONFIG_DIR"
+fi
 
 echo "Uninstall complete"
 EOF
 
     chmod +x "$CONFIG_DIR/uninstall.sh"
-    print_success "Uninstall script created"
-}
-
-# Start the balancer
-start_balancer() {
-    # Kill any existing instance
-    pkill -f "failover.sh" 2>/dev/null
-    
-    # Start in background
-    nohup bash "$CONFIG_DIR/failover.sh" >/dev/null 2>&1 &
-    
-    # Save PID
-    echo $! > "$CONFIG_DIR/balancer.pid"
-    
-    print_success "Balancer started in background"
-}
-
-# Main install function
-simple_install() {
-    echo
-    print_info "Starting Simple Installation"
-    echo "========================================"
-    
-    # Step 1: Check root
-    check_root
-    
-    # Step 2: Basic system check
-    simple_check
-    
-    # Step 3: Get server IPs
-    result=$(get_server_ips)
-    count=$(echo "$result" | head -1)
-    ips=($(echo "$result" | tail -n +2))
-    
-    # Step 4: Install minimal packages
-    install_minimal
-    
-    # Step 5: Create scripts
-    create_failover "$count" "${ips[@]}"
-    create_monitor
-    create_uninstall
-    
-    # Step 6: Start balancer
-    start_balancer
-    
-    echo
-    print_success "════════════════════════════════════════"
-    print_success "Installation Completed!"
-    print_success "════════════════════════════════════════"
-    echo
-    echo "Configuration:"
-    for ((i=0; i<count; i++)); do
-        echo "  Server $((i+1)): ${ips[$i]}"
-    done
-    echo
-    echo "Commands:"
-    echo "  Monitor: $CONFIG_DIR/monitor.sh"
-    echo "  Uninstall: $CONFIG_DIR/uninstall.sh"
-    echo "  Logs: tail -f $CONFIG_DIR/failover.log"
-    echo
-    print_warning "The balancer is running in background"
-}
-
-# Simple uninstall
-simple_uninstall() {
-    echo
-    print_warning "Uninstalling..."
-    
-    if [ -f "$CONFIG_DIR/uninstall.sh" ]; then
-        bash "$CONFIG_DIR/uninstall.sh"
-        print_success "Uninstall completed"
-    else
-        print_error "Uninstall script not found"
-    fi
 }
 
 # Show status
-show_simple_status() {
+show_status() {
     echo
     print_info "Current Status"
     echo "========================================"
     
     if [ -f "$CONFIG_DIR/balancer.pid" ]; then
-        PID=$(cat "$CONFIG_DIR/balancer.pid" 2>/dev/null)
+        PID=$(cat "$CONFIG_DIR/balancer.pid")
         if kill -0 $PID 2>/dev/null; then
             echo -e "${GREEN}✓ Balancer is running (PID: $PID)${NC}"
         else
             echo -e "${RED}✗ Balancer is not running${NC}"
         fi
-    else
-        echo -e "${YELLOW}? Balancer status unknown${NC}"
-    fi
-    
-    if [ -f "$CONFIG_DIR/active.txt" ]; then
-        ACTIVE=$(cat "$CONFIG_DIR/active.txt")
-        echo "Active server: $ACTIVE"
     fi
     
     if [ -f "$CONFIG_DIR/servers.conf" ]; then
         source "$CONFIG_DIR/servers.conf"
         echo
-        echo "Server Status:"
+        echo "Servers:"
         for ((i=1; i<=SERVER_COUNT; i++)); do
-            SERVER_VAR="SERVER_$i"
-            SERVER_IP=${!SERVER_VAR}
-            if ping -c 1 -W 1 "$SERVER_IP" >/dev/null 2>&1; then
-                echo "  Server $i: ${GREEN}Online${NC} ($SERVER_IP)"
-            else
-                echo "  Server $i: ${RED}Offline${NC} ($SERVER_IP)"
-            fi
+            NAME_VAR="SERVER_${i}_NAME"
+            IP_VAR="SERVER_${i}_IP"
+            echo "  $i. ${!NAME_VAR} - ${!IP_VAR}"
         done
     fi
+    
+    if [ -f "$ACTIVE_FILE" ]; then
+        ACTIVE=$(cat "$ACTIVE_FILE")
+        NAME_VAR="SERVER_${ACTIVE}_NAME"
+        IP_VAR="SERVER_${ACTIVE}_IP"
+        echo
+        echo -e "${GREEN}Active: Server $ACTIVE (${!NAME_VAR})${NC}"
+    fi
+    
+    echo
+    echo "Routes:"
+    "$CONFIG_DIR/route-manager.sh" show 2>/dev/null || echo "  No custom routes"
 }
 
-# Simple menu
+# Menu
 show_menu() {
     clear
     echo "════════════════════════════════════════"
-    echo "  Simple Safe Balancer v4.0"
+    echo "  Stable Balancer v5.0"
     echo "════════════════════════════════════════"
     echo
     echo "1) Install"
-    echo "2) Uninstall"
-    echo "3) Status"
-    echo "4) Monitor"
-    echo "5) Exit"
+    echo "2) Start"
+    echo "3) Stop"
+    echo "4) Status"
+    echo "5) Monitor"
+    echo "6) View Log"
+    echo "7) Uninstall"
+    echo "8) Exit"
     echo
-    read -p "Select option [1-5]: " opt
+    read -p "Select option [1-8]: " opt
     
     case $opt in
-        1) simple_install ;;
-        2) simple_uninstall ;;
-        3) show_simple_status ;;
-        4) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" || print_error "Not installed" ;;
-        5) exit 0 ;;
+        1) stable_install ;;
+        2) [ -f "$CONFIG_DIR/start.sh" ] && bash "$CONFIG_DIR/start.sh" || print_error "Not installed" ;;
+        3) pkill -f "stable-failover.sh" && echo "Stopped" ;;
+        4) show_status ;;
+        5) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" || print_error "Not installed" ;;
+        6) [ -f "$LOG_FILE" ] && tail -f "$LOG_FILE" || echo "No log file" ;;
+        7) [ -f "$CONFIG_DIR/uninstall.sh" ] && bash "$CONFIG_DIR/uninstall.sh" || print_error "Not installed" ;;
+        8) exit 0 ;;
         *) print_error "Invalid option" ;;
     esac
 }
 
 # Main
-main() {
-    if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
-        echo "Usage: $0 [install|uninstall|status|monitor|menu]"
-        exit 0
-    fi
-    
-    case $1 in
-        install) simple_install ;;
-        uninstall) simple_uninstall ;;
-        status) show_simple_status ;;
-        monitor) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" || print_error "Not installed" ;;
-        menu|"") while true; do show_menu; read -p "Press Enter..."; done ;;
-        *) echo "Unknown command. Use: $0 --help" ;;
-    esac
-}
-
-main "$@"
+case "$1" in
+    install) stable_install ;;
+    start) [ -f "$CONFIG_DIR/start.sh" ] && bash "$CONFIG_DIR/start.sh" ;;
+    stop) pkill -f "stable-failover.sh" ;;
+    status) show_status ;;
+    monitor) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" ;;
+    uninstall) [ -f "$CONFIG_DIR/uninstall.sh" ] && bash "$CONFIG_DIR/uninstall.sh" ;;
+    menu|"") while true; do show_menu; read -p "Press Enter..."; done ;;
+    *) echo "Usage: $0 {install|start|stop|status|monitor|uninstall|menu}" ;;
+esac
