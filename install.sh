@@ -1,582 +1,436 @@
 #!/bin/bash
 
-# ==============================================
-# Stable Traffic Balancer - No Disconnection
-# Version: 5.0 - Stable Version
-# ==============================================
-
-# Colors
+# Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-# Configuration
-CONFIG_DIR="/root/stable-balancer"
-LOG_FILE="$CONFIG_DIR/balancer.log"
-ACTIVE_FILE="$CONFIG_DIR/active.txt"
-STATUS_FILE="$CONFIG_DIR/status.txt"
-
-# Create config directory
-mkdir -p "$CONFIG_DIR"
-
-# Logging
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-    echo -e "$1"
-}
-
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-    log "[INFO] $1"
-}
-
-print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-    log "[SUCCESS] $1"
-}
-
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    log "[ERROR] $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-    log "[WARNING] $1"
-}
-
-# Check root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "This script must be run as root"
-        exit 1
-    fi
-}
-
-# Get server information
-get_servers() {
-    echo
-    print_info "Foreign Servers Configuration"
-    echo "----------------------------------------"
-    
-    while true; do
-        read -p "Number of foreign servers (1-2): " count
-        if [[ "$count" =~ ^[1-2]$ ]]; then
-            break
-        else
-            print_error "Please enter 1 or 2"
-        fi
-    done
-    
-    declare -a ips
-    declare -a names
-    
-    for ((i=1; i<=count; i++)); do
-        echo
-        read -p "Enter name for Server $i (e.g., Germany, Finland): " name
-        names[$i]="$name"
-        
-        while true; do
-            read -p "Enter IP for Server $i: " ip
-            if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                ips[$i]="$ip"
-                break
-            else
-                print_error "Invalid IP format"
-            fi
-        done
-    done
-    
-    # Save configuration
-    cat > "$CONFIG_DIR/servers.conf" << EOF
-# Server Configuration
-# Created: $(date)
-SERVER_COUNT=$count
-EOF
-    
-    for ((i=1; i<=count; i++)); do
-        echo "SERVER_${i}_NAME=\"${names[$i]}\"" >> "$CONFIG_DIR/servers.conf"
-        echo "SERVER_${i}_IP=\"${ips[$i]}\"" >> "$CONFIG_DIR/servers.conf"
-    done
-    
-    # Return values
-    echo "$count"
-    for ((i=1; i<=count; i++)); do
-        echo "${names[$i]}"
-        echo "${ips[$i]}"
-    done
-}
-
-# Create stable failover script
-create_stable_failover() {
-    cat > "$CONFIG_DIR/stable-failover.sh" << 'EOF'
-#!/bin/bash
-
-CONFIG_DIR="/root/stable-balancer"
-LOG_FILE="$CONFIG_DIR/balancer.log"
-ACTIVE_FILE="$CONFIG_DIR/active.txt"
-STATUS_FILE="$CONFIG_DIR/status.txt"
-
-# Load configuration
-source "$CONFIG_DIR/servers.conf" 2>/dev/null || {
-    echo "No configuration found"
-    exit 1
-}
-
-# Function to log with timestamp
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-# Function to check server health (more reliable)
-check_server() {
-    local ip=$1
-    local name=$2
-    
-    # Method 1: 3 pings with 2 second timeout (more reliable)
-    ping -c 3 -W 2 "$ip" > /dev/null 2>&1
-    local ping_result=$?
-    
-    if [ $ping_result -eq 0 ]; then
-        # Method 2: Try to connect to common ports (optional, doesn't block)
-        if command -v nc >/dev/null 2>&1; then
-            nc -zv -w 2 "$ip" 22 >/dev/null 2>&1 || nc -zv -w 2 "$ip" 443 >/dev/null 2>&1
-            return 0
-        fi
-        return 0
-    fi
-    
-    return 1
-}
-
-# Initialize
-if [ ! -f "$ACTIVE_FILE" ]; then
-    echo "1" > "$ACTIVE_FILE"
-    log_message "Initialized with server 1 as active"
+# Check root access
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}This script must be run as root${NC}"
+   exit 1
 fi
 
-# Variables for stability
-FAIL_COUNT=0
-MAX_FAILS=3
-CHECK_INTERVAL=15  # Check every 15 seconds
-STABLE_COUNT=0
-
-log_message "Stable failover started with $SERVER_COUNT servers"
-
-while true; do
-    CURRENT=$(cat "$ACTIVE_FILE" 2>/dev/null || echo "1")
+# Backup files
+backup_files() {
+    if [[ ! -f /etc/sysctl.conf.backup ]]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.backup
+        echo -e "${GREEN}Backup created: /etc/sysctl.conf.backup${NC}"
+    fi
     
-    # Get current server info
-    CURRENT_NAME_VAR="SERVER_${CURRENT}_NAME"
-    CURRENT_IP_VAR="SERVER_${CURRENT}_IP"
-    CURRENT_NAME=${!CURRENT_NAME_VAR}
-    CURRENT_IP=${!CURRENT_IP_VAR}
+    if [[ ! -f /etc/resolv.conf.backup ]]; then
+        cp /etc/resolv.conf /etc/resolv.conf.backup
+        echo -e "${GREEN}Backup created: /etc/resolv.conf.backup${NC}"
+    fi
+}
+
+# Restore backups
+restore_backups() {
+    if [[ -f /etc/sysctl.conf.backup ]]; then
+        cp /etc/sysctl.conf.backup /etc/sysctl.conf
+        echo -e "${GREEN}Restored sysctl.conf from backup${NC}"
+    fi
     
-    # Check current server
-    if check_server "$CURRENT_IP" "$CURRENT_NAME"; then
-        # Server is healthy
-        FAIL_COUNT=0
-        STABLE_COUNT=$((STABLE_COUNT + 1))
+    if [[ -f /etc/resolv.conf.backup ]]; then
+        cp /etc/resolv.conf.backup /etc/resolv.conf
+        echo -e "${GREEN}Restored resolv.conf from backup${NC}"
+    fi
+}
+
+# Get network interface
+get_interface() {
+    echo $(ip -4 route show default | awk '{print $5}' | head -1)
+}
+
+# Install prerequisites
+install_prerequisites() {
+    echo -e "${YELLOW}Installing prerequisites...${NC}"
+    apt-get update
+    apt-get install -y ethtool irqbalance nano curl wget
+    echo -e "${GREEN}Prerequisites installed${NC}"
+}
+
+# Step 1: Disable TSO/GSO/GRO
+step1() {
+    echo -e "${YELLOW}Step 1: Disabling TSO/GSO/GRO...${NC}"
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        ethtool -K $IF tso off gso off gro off
+        echo -e "${GREEN}✓ TSO/GSO/GRO disabled on $IF${NC}"
         
-        # Update status file
-        echo "ONLINE|$CURRENT|$CURRENT_NAME|$CURRENT_IP|$(date)" > "$STATUS_FILE"
-        
-        log_message "Server $CURRENT ($CURRENT_NAME) is healthy (stable for $STABLE_COUNT checks)"
+        # Make permanent
+        if ! grep -q "ethtool -K $IF" /etc/rc.local; then
+            sed -i '/exit 0/d' /etc/rc.local 2>/dev/null
+            echo "ethtool -K $IF tso off gso off gro off" >> /etc/rc.local
+            echo "exit 0" >> /etc/rc.local
+            chmod +x /etc/rc.local
+        fi
     else
-        # Server might be down, increase fail count
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-        log_message "Server $CURRENT check failed ($FAIL_COUNT/$MAX_FAILS)"
-        
-        if [ $FAIL_COUNT -ge $MAX_FAILS ]; then
-            # Server is considered down, try to switch
-            log_message "Server $CURRENT is considered DOWN after $FAIL_COUNT failures"
-            
-            SWITCHED=0
-            for ((i=1; i<=SERVER_COUNT; i++)); do
-                if [ "$i" != "$CURRENT" ]; then
-                    TEST_NAME_VAR="SERVER_${i}_NAME"
-                    TEST_IP_VAR="SERVER_${i}_IP"
-                    TEST_NAME=${!TEST_NAME_VAR}
-                    TEST_IP=${!TEST_IP_VAR}
-                    
-                    log_message "Testing alternative server $i ($TEST_NAME)"
-                    
-                    if check_server "$TEST_IP" "$TEST_NAME"; then
-                        # Switch to this server
-                        echo "$i" > "$ACTIVE_FILE"
-                        log_message "SWITCHED to server $i ($TEST_NAME) - $TEST_IP"
-                        
-                        # Update main route only if switching
-                        MAIN_IF=$(ip route show default | awk '{print $5}' | head -1)
-                        if [ -n "$MAIN_IF" ]; then
-                            # Remove old route with metric 100 if exists
-                            ip route del default via "$CURRENT_IP" dev "$MAIN_IF" metric 100 2>/dev/null
-                            # Add new route
-                            ip route add default via "$TEST_IP" dev "$MAIN_IF" metric 100 2>/dev/null
-                        fi
-                        
-                        SWITCHED=1
-                        FAIL_COUNT=0
-                        STABLE_COUNT=0
-                        break
-                    fi
-                fi
-            done
-            
-            if [ $SWITCHED -eq 0 ]; then
-                log_message "No alternative servers available"
-                # Keep trying current server
-                FAIL_COUNT=$((MAX_FAILS - 1))
-            fi
-        fi
+        echo -e "${RED}Failed to detect network interface${NC}"
     fi
-    
-    # Dynamic check interval - check more frequently if unstable
-    if [ $STABLE_COUNT -gt 10 ]; then
-        CURRENT_INTERVAL=30  # Check every 30 seconds when stable
+}
+
+# Step 2: Set txqueuelen
+step2() {
+    echo -e "${YELLOW}Step 2: Setting txqueuelen to 2500...${NC}"
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        ip link set dev $IF txqueuelen 2500
+        echo -e "${GREEN}✓ txqueuelen set to 2500 on $IF${NC}"
+        
+        # Make permanent
+        if ! grep -q "ip link set dev $IF txqueuelen" /etc/rc.local; then
+            sed -i '/exit 0/d' /etc/rc.local 2>/dev/null
+            echo "ip link set dev $IF txqueuelen 2500" >> /etc/rc.local
+            echo "exit 0" >> /etc/rc.local
+            chmod +x /etc/rc.local
+        fi
     else
-        CURRENT_INTERVAL=$CHECK_INTERVAL
+        echo -e "${RED}Failed to detect network interface${NC}"
     fi
-    
-    sleep $CURRENT_INTERVAL
-done
-EOF
-
-    chmod +x "$CONFIG_DIR/stable-failover.sh"
-    print_success "Stable failover script created"
 }
 
-# Create improved monitor
-create_improved_monitor() {
-    cat > "$CONFIG_DIR/monitor.sh" << 'EOF'
-#!/bin/bash
+# Step 3: Install and configure irqbalance
+step3() {
+    echo -e "${YELLOW}Step 3: Configuring irqbalance...${NC}"
+    apt-get install -y irqbalance
+    systemctl enable irqbalance
+    systemctl start irqbalance
+    echo -e "${GREEN}✓ irqbalance configured and started${NC}"
+}
 
-CONFIG_DIR="/root/stable-balancer"
-source "$CONFIG_DIR/servers.conf" 2>/dev/null
-
-while true; do
-    clear
-    echo "══════════════════════════════════════════════"
-    echo "  Stable Balancer Monitor - $(date)"
-    echo "══════════════════════════════════════════════"
-    
-    # Show active server
-    if [ -f "$ACTIVE_FILE" ]; then
-        ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null)
-        ACTIVE_NAME_VAR="SERVER_${ACTIVE}_NAME"
-        ACTIVE_IP_VAR="SERVER_${ACTIVE}_IP"
-        ACTIVE_NAME=${!ACTIVE_NAME_VAR}
-        ACTIVE_IP=${!ACTIVE_IP_VAR}
-        
-        echo -e "${GREEN}▶ Active Server: $ACTIVE - $ACTIVE_NAME ($ACTIVE_IP)${NC}"
+# Step 4: Apply HTB qdisc configuration
+step4() {
+    echo -e "${YELLOW}Step 4: Applying HTB qdisc configuration...${NC}"
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        tc qdisc del dev $IF root 2>/dev/null
+        tc qdisc add dev $IF root handle 1: htb default 20
+        tc class add dev $IF parent 1: classid 1:1 htb rate 1gbit ceil 1gbit
+        tc class add dev $IF parent 1:1 classid 1:10 htb rate 200mbit ceil 1gbit prio 1
+        tc class add dev $IF parent 1:1 classid 1:20 htb rate 800mbit ceil 1gbit prio 2
+        tc qdisc add dev $IF parent 1:10 handle 10: fq_codel limit 1000
+        tc qdisc add dev $IF parent 1:20 handle 20: netem delay 15ms limit 10000
+        tc filter add dev $IF parent 1: protocol ip prio 1 u32 match ip dport 22 0xffff flowid 1:10
+        tc filter add dev $IF parent 1: protocol ip prio 1 u32 match ip sport 22 0xffff flowid 1:10
+        tc filter add dev $IF parent 1: protocol ip prio 2 u32 match ip protocol 1 0xff flowid 1:10
+        echo -e "${GREEN}✓ HTB qdisc configuration applied${NC}"
     else
-        echo -e "${YELLOW}▶ No active server${NC}"
+        echo -e "${RED}Failed to detect network interface${NC}"
     fi
-    echo
-    
-    # Show all servers with detailed status
-    echo "Server Status:"
-    echo "----------------------------------------"
-    
-    for ((i=1; i<=SERVER_COUNT; i++)); do
-        NAME_VAR="SERVER_${i}_NAME"
-        IP_VAR="SERVER_${i}_IP"
-        NAME=${!NAME_VAR}
-        IP=${!IP_VAR}
-        
-        # Detailed ping statistics
-        PING_RESULT=$(ping -c 2 -W 1 "$IP" 2>/dev/null)
-        PING_TIME=$(echo "$PING_RESULT" | tail -1 | awk -F'/' '{print $5}' | cut -d'.' -f1)
-        PACKET_LOSS=$(echo "$PING_RESULT" | grep -oP '\d+(?=% packet loss)')
-        
-        if [ -n "$PACKET_LOSS" ] && [ "$PACKET_LOSS" -lt 100 ]; then
-            if [ "$i" -eq "$ACTIVE" ]; then
-                echo -e "${GREEN}✓ Server $i: $NAME - ONLINE (Active)${NC}"
-            else
-                echo -e "${GREEN}✓ Server $i: $NAME - ONLINE${NC}"
-            fi
-            echo "     IP: $IP | Ping: ${PING_TIME}ms | Loss: ${PACKET_LOSS}%"
-        else
-            if [ "$i" -eq "$ACTIVE" ]; then
-                echo -e "${RED}✗ Server $i: $NAME - OFFLINE (Active - WARNING!)${NC}"
-            else
-                echo -e "${RED}✗ Server $i: $NAME - OFFLINE${NC}"
-            fi
-            echo "     IP: $IP | No response"
-        fi
-    done
-    
-    # Show last 5 log entries
-    echo
-    echo "Recent Events:"
-    echo "----------------------------------------"
-    if [ -f "$LOG_FILE" ]; then
-        tail -5 "$LOG_FILE"
+}
+
+# Step 5: Apply Cake qdisc configuration
+step5() {
+    echo -e "${YELLOW}Step 5: Applying Cake qdisc configuration...${NC}"
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        tc qdisc del dev $IF root 2>/dev/null
+        tc qdisc add dev $IF root cake bandwidth 1Gbit besteffort ack-filter nat
+        echo -e "${GREEN}✓ Cake qdisc configuration applied${NC}"
     else
-        echo "No events logged yet"
+        echo -e "${RED}Failed to detect network interface${NC}"
     fi
+}
+
+# Step 6: Apply sysctl configuration
+step6() {
+    echo -e "${YELLOW}Step 6: Applying sysctl configuration...${NC}"
     
-    echo
-    echo "Press Ctrl+C to exit"
-    sleep 5
-done
+    cat > /etc/sysctl.conf << 'EOF'
+# System Optimization Settings
+fs.file-max = 2097152
+fs.nr_open = 2097152
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+vm.swappiness = 5
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.min_free_kbytes = 65536
+vm.vfs_cache_pressure = 50
+vm.overcommit_memory = 1
+
+# Network Core Settings
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.core.dev_weight = 64
+net.core.default_qdisc = fq
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.core.optmem_max = 65536
+
+# IPv4 Settings
+net.ipv4.ip_forward = 1
+net.ipv4.ip_local_port_range = 1024 65535
+
+# TCP Memory Settings
+net.ipv4.tcp_mem = 65536 131072 262144
+net.ipv4.udp_mem = 65536 131072 262144
+net.ipv4.tcp_rmem = 8192 262144 8388608
+net.ipv4.tcp_wmem = 8192 262144 8388608
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+
+# TCP Optimization
+net.ipv4.tcp_congestion_control = cubic
+net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = -2
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
+net.ipv4.tcp_min_snd_mss = 536
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_early_retrans = 1
+net.ipv4.tcp_recovery = 1
+net.ipv4.tcp_thin_linear_timeouts = 1
+net.ipv4.tcp_thin_dpio = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_fin_timeout = 15
+
+# TCP Keepalive Settings
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_probes = 4
+net.ipv4.tcp_keepalive_intvl = 15
+
+# TCP Backlog Settings
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_max_orphans = 32768
+
+# TCP Retry Settings
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_orphan_retries = 1
+net.ipv4.tcp_abort_on_overflow = 0
+
+# Security Settings
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF
 
-    chmod +x "$CONFIG_DIR/monitor.sh"
-    print_success "Improved monitor created"
+    sysctl -p
+    echo -e "${GREEN}✓ sysctl configuration applied${NC}"
 }
 
-# Create route management script
-create_route_manager() {
-    cat > "$CONFIG_DIR/route-manager.sh" << 'EOF'
-#!/bin/bash
+# Advanced optimization
+advanced_optimization() {
+    echo -e "${YELLOW}Applying advanced server optimization...${NC}"
+    
+    cat >> /etc/sysctl.conf << 'EOF'
 
-CONFIG_DIR="/root/stable-balancer"
-source "$CONFIG_DIR/servers.conf" 2>/dev/null
-
-case "$1" in
-    add)
-        SERVER_NUM="$2"
-        if [ -n "$SERVER_NUM" ]; then
-            IP_VAR="SERVER_${SERVER_NUM}_IP"
-            IP=${!IP_VAR}
-            MAIN_IF=$(ip route show default | awk '{print $5}' | head -1)
-            
-            if [ -n "$MAIN_IF" ]; then
-                # Remove any existing metric 100 routes
-                ip route show | grep "metric 100" | while read route; do
-                    ip route del $route 2>/dev/null
-                done
-                # Add new route
-                ip route add default via "$IP" dev "$MAIN_IF" metric 100 2>/dev/null
-                echo "Route added for server $SERVER_NUM ($IP)"
-            fi
-        fi
-        ;;
-    remove)
-        # Remove all metric 100 routes
-        ip route show | grep "metric 100" | while read route; do
-            ip route del $route 2>/dev/null
-        done
-        echo "All custom routes removed"
-        ;;
-    show)
-        ip route show | grep "metric 100" || echo "No custom routes"
-        ;;
-    *)
-        echo "Usage: $0 {add <server_num>|remove|show}"
-        ;;
-esac
+# Advanced Optimization Settings
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 10
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.netdev_max_backlog = 5000
+net.ipv4.tcp_max_tw_buckets = 200000
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
+net.ipv4.tcp_rmem = 4096 87380 8388608
+net.ipv4.tcp_wmem = 4096 16384 8388608
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 33554432
+net.core.wmem_default = 33554432
 EOF
 
-    chmod +x "$CONFIG_DIR/route-manager.sh"
-    print_success "Route manager created"
+    sysctl -p
+    echo -e "${GREEN}✓ Advanced optimization applied${NC}"
 }
 
-# Create startup script
-create_startup() {
-    cat > "$CONFIG_DIR/start.sh" << 'EOF'
-#!/bin/bash
-
-CONFIG_DIR="/root/stable-balancer"
-PID_FILE="$CONFIG_DIR/balancer.pid"
-
-# Kill existing process
-if [ -f "$PID_FILE" ]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 $OLD_PID 2>/dev/null; then
-        echo "Stopping old balancer (PID: $OLD_PID)"
-        kill $OLD_PID
-        sleep 2
-    fi
-fi
-
-# Remove old routes
-"$CONFIG_DIR/route-manager.sh" remove
-
-# Start new balancer
-nohup bash "$CONFIG_DIR/stable-failover.sh" >/dev/null 2>&1 &
-NEW_PID=$!
-echo $NEW_PID > "$PID_FILE"
-
-echo "Balancer started with PID: $NEW_PID"
-
-# Wait a bit and add initial route
-sleep 3
-if [ -f "$CONFIG_DIR/active.txt" ]; then
-    ACTIVE=$(cat "$CONFIG_DIR/active.txt")
-    "$CONFIG_DIR/route-manager.sh" add $ACTIVE
-fi
-
-echo "Startup complete"
-EOF
-
-    chmod +x "$CONFIG_DIR/start.sh"
-    print_success "Startup script created"
-}
-
-# Main installation
-stable_install() {
-    echo
-    print_info "Starting Stable Installation"
-    echo "========================================"
+# Change DNS
+change_dns() {
+    echo -e "${YELLOW}Changing DNS servers...${NC}"
+    echo "Select DNS provider:"
+    echo "1) Google DNS (8.8.8.8, 8.8.4.4)"
+    echo "2) Cloudflare DNS (1.1.1.1, 1.0.0.1)"
+    echo "3) OpenDNS (208.67.222.222, 208.67.220.220)"
+    echo "4) Custom DNS"
+    read -p "Choose option (1-4): " dns_choice
     
-    check_root
-    
-    # Get server information
-    result=$(get_servers)
-    count=$(echo "$result" | head -1)
-    
-    # Create all scripts
-    create_stable_failover
-    create_improved_monitor
-    create_route_manager
-    create_startup
-    
-    # Start the balancer
-    bash "$CONFIG_DIR/start.sh"
-    
-    echo
-    print_success "════════════════════════════════════════"
-    print_success "Installation Completed Successfully!"
-    print_success "════════════════════════════════════════"
-    echo
-    echo "Configuration:"
-    source "$CONFIG_DIR/servers.conf"
-    for ((i=1; i<=SERVER_COUNT; i++)); do
-        NAME_VAR="SERVER_${i}_NAME"
-        IP_VAR="SERVER_${i}_IP"
-        echo "  Server $i: ${!NAME_VAR} (${!IP_VAR})"
-    done
-    echo
-    echo "Commands:"
-    echo "  Start balancer: $CONFIG_DIR/start.sh"
-    echo "  Monitor: $CONFIG_DIR/monitor.sh"
-    echo "  View log: tail -f $CONFIG_DIR/balancer.log"
-    echo "  Route manager: $CONFIG_DIR/route-manager.sh"
-    echo "  Uninstall: $CONFIG_DIR/uninstall.sh"
-    echo
-    print_info "Balancer is running with PID: $(cat $CONFIG_DIR/balancer.pid 2>/dev/null)"
-}
-
-# Create uninstall
-create_uninstall() {
-    cat > "$CONFIG_DIR/uninstall.sh" << 'EOF'
-#!/bin/bash
-
-CONFIG_DIR="/root/stable-balancer"
-
-echo "Uninstalling Stable Balancer..."
-
-# Stop balancer
-if [ -f "$CONFIG_DIR/balancer.pid" ]; then
-    PID=$(cat "$CONFIG_DIR/balancer.pid")
-    kill $PID 2>/dev/null
-    kill -9 $PID 2>/dev/null
-fi
-
-# Kill any remaining processes
-pkill -f "stable-failover.sh" 2>/dev/null
-
-# Remove routes
-"$CONFIG_DIR/route-manager.sh" remove 2>/dev/null
-
-# Ask about removing configuration
-read -p "Remove all configuration files? (y/n): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    rm -rf "$CONFIG_DIR"
-    echo "Configuration removed"
-else
-    echo "Configuration kept in $CONFIG_DIR"
-fi
-
-echo "Uninstall complete"
-EOF
-
-    chmod +x "$CONFIG_DIR/uninstall.sh"
-}
-
-# Show status
-show_status() {
-    echo
-    print_info "Current Status"
-    echo "========================================"
-    
-    if [ -f "$CONFIG_DIR/balancer.pid" ]; then
-        PID=$(cat "$CONFIG_DIR/balancer.pid")
-        if kill -0 $PID 2>/dev/null; then
-            echo -e "${GREEN}✓ Balancer is running (PID: $PID)${NC}"
-        else
-            echo -e "${RED}✗ Balancer is not running${NC}"
-        fi
-    fi
-    
-    if [ -f "$CONFIG_DIR/servers.conf" ]; then
-        source "$CONFIG_DIR/servers.conf"
-        echo
-        echo "Servers:"
-        for ((i=1; i<=SERVER_COUNT; i++)); do
-            NAME_VAR="SERVER_${i}_NAME"
-            IP_VAR="SERVER_${i}_IP"
-            echo "  $i. ${!NAME_VAR} - ${!IP_VAR}"
-        done
-    fi
-    
-    if [ -f "$ACTIVE_FILE" ]; then
-        ACTIVE=$(cat "$ACTIVE_FILE")
-        NAME_VAR="SERVER_${ACTIVE}_NAME"
-        IP_VAR="SERVER_${ACTIVE}_IP"
-        echo
-        echo -e "${GREEN}Active: Server $ACTIVE (${!NAME_VAR})${NC}"
-    fi
-    
-    echo
-    echo "Routes:"
-    "$CONFIG_DIR/route-manager.sh" show 2>/dev/null || echo "  No custom routes"
-}
-
-# Menu
-show_menu() {
-    clear
-    echo "════════════════════════════════════════"
-    echo "  Stable Balancer v5.0"
-    echo "════════════════════════════════════════"
-    echo
-    echo "1) Install"
-    echo "2) Start"
-    echo "3) Stop"
-    echo "4) Status"
-    echo "5) Monitor"
-    echo "6) View Log"
-    echo "7) Uninstall"
-    echo "8) Exit"
-    echo
-    read -p "Select option [1-8]: " opt
-    
-    case $opt in
-        1) stable_install ;;
-        2) [ -f "$CONFIG_DIR/start.sh" ] && bash "$CONFIG_DIR/start.sh" || print_error "Not installed" ;;
-        3) pkill -f "stable-failover.sh" && echo "Stopped" ;;
-        4) show_status ;;
-        5) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" || print_error "Not installed" ;;
-        6) [ -f "$LOG_FILE" ] && tail -f "$LOG_FILE" || echo "No log file" ;;
-        7) [ -f "$CONFIG_DIR/uninstall.sh" ] && bash "$CONFIG_DIR/uninstall.sh" || print_error "Not installed" ;;
-        8) exit 0 ;;
-        *) print_error "Invalid option" ;;
+    case $dns_choice in
+        1)
+            echo "nameserver 8.8.8.8" > /etc/resolv.conf
+            echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+            ;;
+        2)
+            echo "nameserver 1.1.1.1" > /etc/resolv.conf
+            echo "nameserver 1.0.0.1" >> /etc/resolv.conf
+            ;;
+        3)
+            echo "nameserver 208.67.222.222" > /etc/resolv.conf
+            echo "nameserver 208.67.220.220" >> /etc/resolv.conf
+            ;;
+        4)
+            read -p "Enter primary DNS: " dns1
+            read -p "Enter secondary DNS: " dns2
+            echo "nameserver $dns1" > /etc/resolv.conf
+            echo "nameserver $dns2" >> /etc/resolv.conf
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            return
+            ;;
     esac
+    
+    # Make permanent
+    if [[ -f /etc/resolvconf/resolv.conf.d/head ]]; then
+        cat /etc/resolv.conf > /etc/resolvconf/resolv.conf.d/head
+        resolvconf -u
+    fi
+    
+    echo -e "${GREEN}✓ DNS changed successfully${NC}"
 }
 
-# Main
-case "$1" in
-    install) stable_install ;;
-    start) [ -f "$CONFIG_DIR/start.sh" ] && bash "$CONFIG_DIR/start.sh" ;;
-    stop) pkill -f "stable-failover.sh" ;;
-    status) show_status ;;
-    monitor) [ -f "$CONFIG_DIR/monitor.sh" ] && bash "$CONFIG_DIR/monitor.sh" ;;
-    uninstall) [ -f "$CONFIG_DIR/uninstall.sh" ] && bash "$CONFIG_DIR/uninstall.sh" ;;
-    menu|"") while true; do show_menu; read -p "Press Enter..."; done ;;
-    *) echo "Usage: $0 {install|start|stop|status|monitor|uninstall|menu}" ;;
-esac
+# Change MTU
+change_mtu() {
+    echo -e "${YELLOW}Changing MTU...${NC}"
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        read -p "Enter MTU value (default: 1500): " mtu_value
+        mtu_value=${mtu_value:-1500}
+        
+        ip link set dev $IF mtu $mtu_value
+        echo -e "${GREEN}✓ MTU changed to $mtu_value on $IF${NC}"
+        
+        # Make permanent
+        if ! grep -q "ip link set dev $IF mtu" /etc/rc.local; then
+            sed -i '/exit 0/d' /etc/rc.local 2>/dev/null
+            echo "ip link set dev $IF mtu $mtu_value" >> /etc/rc.local
+            echo "exit 0" >> /etc/rc.local
+            chmod +x /etc/rc.local
+        fi
+    else
+        echo -e "${RED}Failed to detect network interface${NC}"
+    fi
+}
+
+# Uninstall all changes
+uninstall_changes() {
+    echo -e "${YELLOW}Uninstalling all changes...${NC}"
+    
+    # Restore sysctl
+    restore_backups
+    
+    # Reset network interface
+    IF=$(get_interface)
+    if [[ -n "$IF" ]]; then
+        tc qdisc del dev $IF root 2>/dev/null
+        ethtool -K $IF tso on gso on gro on 2>/dev/null
+        ip link set dev $IF txqueuelen 1000
+    fi
+    
+    # Remove rc.local entries
+    if [[ -f /etc/rc.local ]]; then
+        > /etc/rc.local
+        echo "#!/bin/bash" > /etc/rc.local
+        echo "exit 0" >> /etc/rc.local
+    fi
+    
+    # Disable irqbalance
+    systemctl stop irqbalance
+    systemctl disable irqbalance
+    
+    echo -e "${GREEN}✓ All changes uninstalled${NC}"
+    echo -e "${YELLOW}Reboot recommended for complete reset${NC}"
+}
+
+# Full installation
+full_installation() {
+    echo -e "${BLUE}Starting full optimization installation...${NC}"
+    backup_files
+    install_prerequisites
+    step1
+    step2
+    step3
+    step4
+    step5
+    step6
+    advanced_optimization
+    echo -e "${GREEN}✓ Full optimization completed successfully${NC}"
+}
+
+# Main menu
+while true; do
+    clear
+    echo -e "${BLUE}================================${NC}"
+    echo -e "${GREEN}    Server Optimization Script    ${NC}"
+    echo -e "${BLUE}================================${NC}"
+    echo -e "${YELLOW}Available options:${NC}"
+    echo -e "${GREEN}1)${NC} Full installation (all optimizations)"
+    echo -e "${GREEN}2)${NC} Uninstall all changes"
+    echo -e "${GREEN}3)${NC} Reboot server"
+    echo -e "${GREEN}4)${NC} Change DNS"
+    echo -e "${GREEN}5)${NC} Change MTU"
+    echo -e "${GREEN}6)${NC} Advanced optimization only"
+    echo -e "${GREEN}7)${NC} Exit"
+    echo -e "${BLUE}================================${NC}"
+    
+    read -p "Choose an option (1-7): " choice
+    
+    case $choice in
+        1)
+            full_installation
+            read -p "Press Enter to continue..."
+            ;;
+        2)
+            uninstall_changes
+            read -p "Press Enter to continue..."
+            ;;
+        3)
+            echo -e "${YELLOW}Rebooting server...${NC}"
+            reboot
+            ;;
+        4)
+            change_dns
+            read -p "Press Enter to continue..."
+            ;;
+        5)
+            change_mtu
+            read -p "Press Enter to continue..."
+            ;;
+        6)
+            backup_files
+            advanced_optimization
+            read -p "Press Enter to continue..."
+            ;;
+        7)
+            echo -e "${GREEN}Exiting...${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            read -p "Press Enter to continue..."
+            ;;
+    esac
+done
